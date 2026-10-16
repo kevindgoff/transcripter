@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="voice-recorder",
+    name="transcripter",
     version="0.1.0",
     description="Real-time audio transcription tool using local Whisper models",
     author="Coder",
@@ -14,7 +14,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "voice-record=src.voice_recorder_cli:main",
+            "transcripter=src.voice_recorder_cli:main",
         ],
     },
 )

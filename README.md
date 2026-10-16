@@ -1,4 +1,4 @@
-# Voice Recorder - Real-time Audio Transcription Tool
+# Transcripter - Real-time Audio Transcription Tool
 
 A CLI tool that records audio from your microphone and transcribes it to markdown using local Whisper models.
 
@@ -26,7 +26,7 @@ pip install sounddevice faster-whisper numpy
 ### Basic Recording
 
 ```bash
-voice-record
+transcripter
 ```
 
 This will:
@@ -38,20 +38,20 @@ This will:
 ### Custom Output Directory
 
 ```bash
-voice-record --output-dir ~/my-voices
+transcripter --output-dir ~/my-voices
 ```
 
 ### Different Model Size
 
 ```bash
 # Faster but less accurate
-voice-record --model tiny
+transcripter --model tiny
 
 # Balanced (default)
-voice-record --model small
+transcripter --model small
 
 # High quality
-voice-record --model medium
+transcripter --model medium
 ```
 
 ## Requirements
@@ -82,7 +82,7 @@ voice_recorder_cli.py (CLI)
 
 ## File Flow
 
-1. User runs `voice-record` command
+1. User runs `transcripter` command
 2. System detects default microphone
 3. Audio recorded to temporary WAV file (16kHz, mono)
 4. Whisper model processes audio
@@ -118,7 +118,7 @@ The tool continues recording even if transcription fails. Check the exit code to
 
 ### Slow performance
 
-Use a smaller model: `voice-record --model tiny` for faster processing.
+Use a smaller model: `transcripter --model tiny` for faster processing.
 
 ## License
 
