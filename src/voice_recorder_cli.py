@@ -338,6 +338,10 @@ class VoiceRecorder:
             print(f"Error saving transcript: {e}")
             sys.exit(2)
     
+    def _signal_handler(self, signum, frame):
+        """Handle Ctrl+C gracefully."""
+        print("\n\nInterrupt received...")
+    
     def run(self, args):
         """Main recording loop."""
         
@@ -389,6 +393,10 @@ class VoiceRecorder:
 def _signal_handler(signum, frame):
     """Handle Ctrl+C gracefully."""
     print("\n\nInterrupt received...")
+
+
+# Global signal handler reference for VoiceRecorder to use
+_signal_handler_ref = _signal_handler
 
 
 def main():
