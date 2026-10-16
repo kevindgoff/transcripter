@@ -237,7 +237,27 @@ class Transcriber:
                 word_timestamps=True
             )
             
-            transcript = result[0].text.strip()
+            # Handle faster-whisper return: (segments_list, TranscriptionInfo) tuple
+            if isinstance(result, tuple):
+                segments = result[0]
+                # Convert generator to list if needed
+                if hasattr(segments, '__iter__') and not isinstance(segments, list):
+                    segments = list(segments)
+                transcript = segments[0].text.strip() if len(segments) > 0 else ""
+            elif isinstance(result, list):
+                transcript = result[0].text.strip() if len(result) > 0 else ""
+            elif hasattr(result, 'text'):
+                transcript = result.text.strip()
+            else:
+                # Fallback: try to extract text from any iterable
+                full_text = ""
+                for item in result:
+                    if isinstance(item, dict) and 'text' in item:
+                        full_text += item['text']
+                    elif hasattr(item, 'text'):
+                        full_text += item.text
+                transcript = full_text.strip()
+
             print("-" * 50)
             print(f"\nTranscription complete: {len(transcript)} characters")
             
@@ -356,36 +376,22 @@ class VoiceRecorder:
             # Start recording
             self.start_recording()
             
-            # Main loop - in real implementation this would stream chunks
-            # For MVP, we'll record the entire audio then transcribe once
-            print("\nRecording complete. Processing transcription...")
+            # Wait for Ctrl+C to stop (simple blocking approach)
+            print("\nPress Ctrl+C to stop recording and transcribe...")
+            
+        except KeyboardInterrupt:
+            print("\n\nInterrupt received...")
             
             # Stop recording and get audio data
             audio_data = self.stop_recording()
             
-            if not audio_data:
-                print("Error: Failed to capture audio.")
-                sys.exit(1)
-            
-            # Transcribe the full recording
-            transcript = self.transcriber.transcribe_streaming(audio_data)
-            
-            # Save to file
-            filepath = self.save_transcript(transcript)
-            
-        except KeyboardInterrupt:
-            print("\n\nRecording interrupted.")
-            try:
-                audio_data = self.stop_recording()
+            if audio_data:
+                # Transcribe the captured audio
+                transcript = self.transcriber.transcribe_streaming(audio_data)
                 
-                if audio_data and self.transcriber._model:
-                    # Try to transcribe partial recording
-                    transcript = self.transcriber.transcribe_streaming(audio_data)
-                    filepath = self.save_transcript(transcript)
-                    
-            except Exception as e:
-                print(f"Error during interrupt handling: {e}")
-            
+                # Save to file
+                filepath = self.save_transcript(transcript)
+
         finally:
             signal.signal(signal.SIGINT, original_handler)
 
