@@ -54,12 +54,35 @@ transcripter --model small
 transcripter --model medium
 ```
 
+### Speaker Labels (Who Said What)
+
+```bash
+pip install "sherpa-onnx"        # or: pip install -e ".[diarize]"
+transcripter --diarize --speakers 2
+```
+
+Output looks like:
+
+```
+**Speaker 1** (00:00): Hi Sanjay, can you help me understand what Generative AI is?
+
+**Speaker 2** (00:14): Sure. It refers to models that can generate new content...
+```
+
+- Runs **locally** after you press Ctrl+C. Two small ONNX models (~30 MB) are downloaded to `~/.cache/transcripter/` on first use. No torch, no accounts.
+- **Pass `--speakers N` when you know the count.** Auto-detect (`--diarize` alone) tends to under-count; on one test clip it found 1 speaker where there were 2.
+- **It is slow on a Raspberry Pi.** Measured on a 4-core Pi: ~1.3x real-time end to end with `--model small` (a 55 s clip took 73 s). Use `--model base` or `tiny` for long recordings.
+- Labels are **per recording**: "Speaker 1" in one file is not necessarily the same person as "Speaker 1" in another.
+- Limits: overlapping speech is not separated, and turn boundaries can be off by a second or two, especially on very short replies ("Yeah, sure"). Treat labels as a good guide, not a legal transcript.
+- If diarization can't load (e.g. no network on first use), you still get the normal unlabelled transcript.
+
 ## Requirements
 
 - **Physical microphone** connected to your system
 - **sounddevice** package for cross-platform audio capture
 - **faster-whisper** package for local transcription
-- **Python 3.8+**
+- **sherpa-onnx** (optional) for `--diarize`
+- **Python 3.10+**
 
 ## Exit Codes
 
