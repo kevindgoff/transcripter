@@ -42,3 +42,4 @@ Thumbs.db
 cache/
 logs/
 *.md  # Exclude markdown docs from repo (add manually if needed)
+.pytest_cache/
