@@ -16,17 +16,37 @@ Optionally labels who said what, and writes closed-caption (`.srt`) files.
 
 ## Installation
 
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+Clone the repo, then install it **into a virtual environment** (this is what creates the `transcripter` command):
 
-pip install sounddevice faster-whisper numpy rich
-pip install sherpa-onnx        # optional: only for --diarize
-pip install pytest             # optional: only to run the tests
-# or, from a checkout:  pip install -e ".[diarize,test]"
+```bash
+git clone https://github.com/kevindgoff/transcripter.git
+cd transcripter
+
+python -m venv venv
+source venv/bin/activate          # macOS / Linux
+# Windows PowerShell:  venv\Scripts\Activate.ps1
+# Windows cmd:         venv\Scripts\activate.bat
+
+pip install -e .                  # installs the dependencies AND the `transcripter` command
 ```
 
-Python 3.10 or newer.
+Optional extras (quote the brackets in PowerShell and zsh):
+
+```bash
+pip install -e ".[diarize]"       # speaker labels (--diarize)
+pip install -e ".[diarize,test]"  # ...plus pytest, to run the tests
+```
+
+Python 3.10 or newer. Check it worked: `transcripter --help`.
+
+> **Installing only the dependencies is not enough.** `pip install sounddevice faster-whisper ...` gets the libraries but does not create the `transcripter` command, and you will see *"'transcripter' is not recognized"*. You need `pip install -e .` from inside the repo folder. Without the command you can always run the script directly (the dependencies must still be installed): `python src/voice_recorder_cli.py --help`.
+
+### Windows notes
+
+- **"The term 'transcripter' is not recognized"**: the package was not installed into the active venv. Run `pip install -e .` from the repo folder. If it still fails, use `python -m pip install -e .` so pip and python are guaranteed to be the same install, and check `dir venv\Scripts\transcripter*` shows `transcripter.exe`.
+- **PowerShell refuses to run `Activate.ps1`** ("running scripts is disabled"): run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, or use cmd and `activate.bat` instead.
+- **Venv not activated**: you can still run `venv\Scripts\transcripter.exe` directly.
+- If you move or rename the folder after installing, recreate the venv and reinstall (the command's launcher stores absolute paths).
 
 ## Usage
 
@@ -55,9 +75,12 @@ If a name is already taken, `_1`, `_2`... is appended; nothing is ever overwritt
 | `--speakers N`, `-n` | Number of speakers, if known (implies `--diarize`) |
 | `--no-audio` | Do not keep the `.wav` |
 | `--from-file WAV` | Transcribe an existing recording instead of using the mic |
-| `--no-ui` | Plain text output (automatic when output is piped or not a terminal) |
+| `--no-ui` | Plain text output: no colours, no screen clear (automatic when output is piped or not a terminal) |
+| `--version`, `-V` | Print the version and exit |
 
 ### While recording
+
+The screen is cleared when the app starts, so the recording display is the only thing on screen (your scrollback is kept). This only happens on an interactive terminal: with `--no-ui`, or when output is piped or redirected, nothing is cleared and no escape codes are written.
 
 On a terminal you get a live display: a blinking `● REC`, the elapsed time (`MM:SS`, `HH:MM:SS` past an hour), a green-to-red level meter and 16 frequency bars. If no signal arrives for 3 seconds it warns you ("No input signal - is the microphone connected and unmuted?"), and it flags clipping. Press **Ctrl+C** to stop.
 
@@ -122,6 +145,14 @@ A 17.5 minute recording, run through the real pipeline:
 Both stages scale roughly linearly with length, so a 2-hour meeting should take about 55 minutes with `--model base`, and about an hour with `tiny` plus speaker labels (extrapolated, not measured at that length). `--model small` is much slower: on a 55 s clip with speaker labels it ran at about 1.3x real-time, which would be well over two hours for a two-hour meeting. Word timestamps (needed for `--srt` and `--diarize`) add noticeable time on top of plain transcription.
 
 Memory grows only with the 16-bit audio kept for processing (about 115 MB per hour), not with the number of chunks.
+
+## Version
+
+```bash
+transcripter --version     # transcripter 1.0.0
+```
+
+The version is stored in one place: `__version__` near the top of `src/voice_recorder_cli.py`. `setup.py` reads it from there, so the installed package metadata, `--version` and the banner always agree. To release a new version, change that one line (and re-run `pip install -e .` so installed metadata updates).
 
 ## Output format
 

@@ -44,6 +44,9 @@ from typing import Callable
 
 TARGET_RATE = 16000  # Whisper and the diarizer both expect 16 kHz mono
 
+# Single source of truth for the version. setup.py reads this line (without
+# importing the module), and `--version` prints it. Bump it here only.
+__version__ = "1.0.0"
 # Long recordings are transcribed in chunks so memory stays flat no matter how
 # long the meeting is. Each chunk is cut at the quietest moment near its end.
 CHUNK_SECONDS = 600.0          # target chunk length
@@ -1084,9 +1087,12 @@ class PlainUI:
     """Line-oriented output. Used when stdout is not a terminal (pipes, cron,
     tests), when `rich` is missing, or when the user passes --no-ui."""
 
+    def clear(self) -> None:
+        """Wipe the screen at startup. A no-op here: plain output may be a pipe or a log."""
+
     def banner(self) -> None:
         print("=" * 60)
-        print("Voice Recorder - Real-time Transcription")
+        print(f"Voice Recorder v{__version__} - Real-time Transcription")
         print("=" * 60)
 
     def info(self, msg: str) -> None:
@@ -1129,8 +1135,12 @@ class RichUI(PlainUI):
 
         self.console = console or Console()
 
+    def clear(self) -> None:
+        self.console.clear()  # clears the visible screen and homes the cursor; scrollback is kept
+
     def banner(self) -> None:
-        self.console.rule("[bold cyan]Voice Recorder[/bold cyan] - real-time transcription", style="cyan")
+        self.console.rule(f"[bold cyan]Voice Recorder[/bold cyan] [dim]v{__version__}[/dim] - real-time transcription",
+                          style="cyan")
 
     def info(self, msg: str) -> None:
         self.console.print(msg, markup=False, highlight=False)
@@ -1470,6 +1480,10 @@ Exit codes: 0 ok, 1 no mic / unreadable input, 2 cannot write output,
         "--from-file", type=str, default=None, metavar="WAV",
         help="Transcribe an existing 16-bit PCM WAV instead of recording",
     )
+    parser.add_argument(
+        "--version", "-V", action="version", version=f"transcripter {__version__}",
+        help="Show the version and exit",
+    )
     args = parser.parse_args()
     if args.speakers is not None:
         if args.speakers < 1:
@@ -1478,7 +1492,9 @@ Exit codes: 0 ok, 1 no mic / unreadable input, 2 cannot write output,
     if args.from_file and not Path(args.from_file).expanduser().is_file():
         parser.error(f"--from-file: no such file: {args.from_file}")
 
-    app = VoiceRecorder(make_ui(args.no_ui))
+    ui = make_ui(args.no_ui)
+    ui.clear()  # start on a clean screen (interactive terminals only)
+    app = VoiceRecorder(ui)
     app.setup(args)
     app.run(args)
 

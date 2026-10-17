@@ -330,6 +330,8 @@ def test_cli_in_a_real_terminal_draws_progress_and_a_pipe_gets_plain_text(testda
     tty_out = b"".join(chunks).decode("utf-8", "replace")
     assert proc.returncode == 0, tty_out
     assert "\x1b[" in tty_out                                       # colour / cursor control: Rich was used
+    assert "\x1b[2J" in tty_out                                     # the screen was cleared...
+    assert tty_out.index("\x1b[2J") < tty_out.index("Output directory")  # ...before anything was printed
     plain = strip_ansi(tty_out)
     assert "Transcribing" in plain and "100%" in plain and "Transcript saved" in plain
 
