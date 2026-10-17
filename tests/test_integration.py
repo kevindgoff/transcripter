@@ -41,6 +41,35 @@ def test_cli_from_file_with_speakers_writes_labelled_transcript(testdata, models
     assert [p.suffix for p in out.iterdir()] == [".md"]  # input wav is not copied
 
 
+def test_cli_srt_with_real_models_is_valid_and_aligned(testdata, models_available, tmp_path):
+    """Whole pipeline on real speech: .srt must parse strictly, carry speaker labels,
+    stay inside the audio, and be accepted by ffmpeg."""
+    import shutil
+    from test_srt import parse_srt
+
+    clip = testdata("1-two-speakers-en.wav")
+    out = tmp_path / "out"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--from-file", str(clip), "-o", str(out), "-m", "tiny", "--speakers", "2", "--srt"],
+        capture_output=True, text=True, timeout=240,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert sorted(p.name for p in out.iterdir()) == ["1-two-speakers-en.md", "1-two-speakers-en.srt"]
+    srt = (out / "1-two-speakers-en.srt").read_bytes().decode("utf-8")
+    cues = parse_srt(srt)
+    duration_ms = int(len(v.read_wav_as_16k_mono(clip)) / v.TARGET_RATE * 1000)
+    assert len(cues) >= 2 and cues[-1][1] <= duration_ms
+    assert 500 <= cues[0][0] <= 3000                     # speech starts about 1.5 s into this clip
+    text = " ".join(" ".join(c[2]) for c in cues)
+    assert "Speaker 1:" in text and "Speaker 2:" in text and "pencil" in text.lower()
+    if shutil.which("ffmpeg"):
+        ff = subprocess.run(["ffmpeg", "-v", "error", "-i", str(out / "1-two-speakers-en.srt"), "-f", "webvtt", "-"],
+                            capture_output=True, text=True)
+        assert ff.returncode == 0 and ff.stderr == ""
+        assert ff.stdout.count(" --> ") == len(cues)  # an independent parser sees every cue
+    assert "**Captions:** [1-two-speakers-en.srt]" in (out / "1-two-speakers-en.md").read_text()
+
+
 def test_chunked_transcription_matches_single_pass(testdata, tiny):
     """Cutting a recording into chunks must not lose or invent words, and must keep timestamps absolute."""
     x = v.read_wav_as_16k_mono(testdata("3-two-speakers-en.wav"))  # 55 s

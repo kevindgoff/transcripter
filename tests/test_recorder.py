@@ -1,5 +1,4 @@
 """AudioRecorder against a fake sounddevice: streaming, levels, fallbacks, failures."""
-import sys
 import time
 import wave
 

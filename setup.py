@@ -11,10 +11,12 @@ setup(
         "sounddevice>=0.5.0",
         "faster-whisper>=1.0.0",
         "numpy>=1.24.0",
+        "rich>=13.0",  # live recording display + progress bars; the CLI falls back to plain text without it
     ],
     extras_require={
         # Speaker labels (--diarize). Optional: imported lazily, so base installs stay light.
         "diarize": ["sherpa-onnx>=1.10"],
+        "test": ["pytest>=7"],
     },
     entry_points={
         "console_scripts": [

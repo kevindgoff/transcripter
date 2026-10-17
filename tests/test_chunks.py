@@ -58,10 +58,8 @@ def test_no_chunk_is_much_longer_than_asked():
 def test_cuts_stay_within_the_search_window_when_nothing_is_quiet():
     x = noise(300, seed=3)
     chunks = v.plan_chunks(x, chunk_s=60, search_s=5, threshold_s=90)
-    start = 0
     for a, b in chunks[:-1]:
         assert 55 <= (b - a) / SR <= 60
-        start = b
 
 
 def test_a_four_hour_recording_is_planned_quickly_and_sanely():

@@ -1,67 +1,83 @@
 # Transcripter - Real-time Audio Transcription Tool
 
 A CLI tool that records audio from your microphone and transcribes it to markdown using local Whisper models.
+Optionally labels who said what, and writes closed-caption (`.srt`) files.
 
 ## Features
 
-- **Real-time streaming**: Text appears in terminal as you speak (post-processing for MVP)
-- **Cross-platform**: Works on macOS, Windows, and Linux
-- **Local processing**: No internet required - all transcription happens locally
-- **Configurable output**: Choose where to save transcripts with `--output-dir`
-- **Multiple model sizes**: From tiny (~76MB) to large (~3GB)
+- **Local processing**: no internet required - transcription happens on your machine
+- **Saves your audio**: every recording is kept as a `.wav` next to its transcript
+- **Built for long meetings**: audio streams to disk while you record, so memory stays flat and a crash does not lose the meeting
+- **Speaker labels** (`--diarize`): "Speaker 1 / Speaker 2" transcripts
+- **Closed captions** (`--srt`): a standards-compliant SubRip file you can load in any video player
+- **Live recording display**: running clock, level meter and a colourful spectrum; real progress bars while transcribing
+- **Cross-platform**: macOS, Windows, Linux
+- **Multiple model sizes**: from tiny (~76MB) to large (~3GB)
 
 ## Installation
 
 ```bash
-# Create virtual environment (recommended)
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Install dependencies
-pip install sounddevice faster-whisper numpy
+pip install sounddevice faster-whisper numpy rich
+pip install sherpa-onnx        # optional: only for --diarize
+pip install pytest             # optional: only to run the tests
+# or, from a checkout:  pip install -e ".[diarize,test]"
 ```
+
+Python 3.10 or newer.
 
 ## Usage
 
-### Basic Recording
-
 ```bash
-transcripter
+transcripter                       # record until Ctrl+C, then transcribe
+transcripter --output-dir ~/notes  # where the files go (default: current directory)
+transcripter --model tiny          # faster, less accurate (tiny, base, small, medium, large)
 ```
 
-This will:
-1. Detect and use your default microphone
-2. Record audio to WAV format
-3. Transcribe using the small Whisper model (default)
-4. Save transcript as `YYYY-MM-DD_HH-MM-SS.md` in current directory
+Each recording produces files that share one base name:
 
-### Custom Output Directory
-
-```bash
-transcripter --output-dir ~/my-voices
+```
+2026-10-16_22-48-48.wav   the audio (16 kHz mono)
+2026-10-16_22-48-48.md    the transcript
+2026-10-16_22-48-48.srt   captions (only with --srt)
 ```
 
-### Different Model Size
+If a name is already taken, `_1`, `_2`... is appended; nothing is ever overwritten.
+
+| Option | What it does |
+|---|---|
+| `--output-dir DIR`, `-o` | Directory for all output files |
+| `--model SIZE`, `-m` | Whisper model: `tiny`, `base`, `small` (default), `medium`, `large` |
+| `--srt` | Also write `<name>.srt` closed captions |
+| `--diarize` | Label speakers (needs `sherpa-onnx`) |
+| `--speakers N`, `-n` | Number of speakers, if known (implies `--diarize`) |
+| `--no-audio` | Do not keep the `.wav` |
+| `--from-file WAV` | Transcribe an existing recording instead of using the mic |
+| `--no-ui` | Plain text output (automatic when output is piped or not a terminal) |
+
+### While recording
+
+On a terminal you get a live display: a blinking `● REC`, the elapsed time (`MM:SS`, `HH:MM:SS` past an hour), a green-to-red level meter and 16 frequency bars. If no signal arrives for 3 seconds it warns you ("No input signal - is the microphone connected and unmuted?"), and it flags clipping. Press **Ctrl+C** to stop.
+
+### While transcribing
+
+Real progress bars (audio processed / total, speed as a multiple of real-time, elapsed and estimated time remaining) for transcription and, with `--diarize`, for speaker identification. The bar advances as each piece of speech is finished, so it moves in steps rather than smoothly.
+
+### Closed captions (`--srt`)
 
 ```bash
-# Faster but less accurate
-transcripter --model tiny
-
-# Balanced (default)
-transcripter --model small
-
-# High quality
-transcripter --model medium
+transcripter --srt
 ```
 
-### Speaker Labels (Who Said What)
+Writes a SubRip file: numbered cues, `HH:MM:SS,mmm --> HH:MM:SS,mmm` timing, UTF-8, CRLF line endings. Cue times start at 0 and match the saved `.wav`. Cues follow standard caption conventions: at most 2 lines of 42 characters, 1-7 seconds on screen, never overlapping, broken at pauses and sentence ends. With `--diarize`, the first cue of each turn starts with `Speaker N:`.
+
+### Speaker labels (`--diarize`)
 
 ```bash
-pip install "sherpa-onnx"        # or: pip install -e ".[diarize]"
 transcripter --diarize --speakers 2
 ```
-
-Output looks like:
 
 ```
 **Speaker 1** (00:00): Hi Sanjay, can you help me understand what Generative AI is?
@@ -69,79 +85,112 @@ Output looks like:
 **Speaker 2** (00:14): Sure. It refers to models that can generate new content...
 ```
 
-- Runs **locally** after you press Ctrl+C. Two small ONNX models (~30 MB) are downloaded to `~/.cache/transcripter/` on first use. No torch, no accounts.
-- **Pass `--speakers N` when you know the count.** Auto-detect (`--diarize` alone) tends to under-count; on one test clip it found 1 speaker where there were 2.
-- **It is slow on a Raspberry Pi.** Measured on a 4-core Pi: ~1.3x real-time end to end with `--model small` (a 55 s clip took 73 s). Use `--model base` or `tiny` for long recordings.
+- Runs **locally** after you press Ctrl+C. Two small ONNX models (~30 MB) download to `~/.cache/transcripter/` on first use. No torch, no accounts.
+- **Pass `--speakers N` when you know the count.** Auto-detect tends to under-count.
 - Labels are **per recording**: "Speaker 1" in one file is not necessarily the same person as "Speaker 1" in another.
-- Limits: overlapping speech is not separated, and turn boundaries can be off by a second or two, especially on very short replies ("Yeah, sure"). Treat labels as a good guide, not a legal transcript.
-- If diarization can't load (e.g. no network on first use), you still get the normal unlabelled transcript.
+- Limits: overlapping speech is not separated, and turn boundaries can be off by a second or two, especially on very short replies ("Yeah, sure").
+- If diarization cannot load (e.g. no network on first use), you still get the normal unlabelled transcript.
 
-## Requirements
+### Re-processing a recording (`--from-file`)
 
-- **Physical microphone** connected to your system
-- **sounddevice** package for cross-platform audio capture
-- **faster-whisper** package for local transcription
-- **sherpa-onnx** (optional) for `--diarize`
-- **Python 3.10+**
+Every recording is saved, so you can transcribe it again with a different model or speaker count without re-recording:
 
-## Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | No microphone found / Audio capture failed |
-| 2 | Disk full / I/O error saving transcript |
-| 3 | Invalid model size / Model load failed |
-
-## Architecture
-
-```
-voice_recorder_cli.py (CLI)
-├── AudioRecorder    # Cross-platform WAV recording using sounddevice
-│   └── Records to WAV format (16kHz, mono, 16-bit)
-└── Transcriber      # Whisper integration using faster-whisper
-    └── Processes full recording after capture completes
+```bash
+transcripter --from-file 2026-10-16_22-48-48.wav --model medium --speakers 3 --srt
 ```
 
-## File Flow
+Accepts 16-bit PCM WAV at any sample rate and channel count. Output is named after the input file.
 
-1. User runs `transcripter` command
-2. System detects default microphone
-3. Audio recorded to temporary WAV file (16kHz, mono)
-4. Whisper model processes audio
-5. Transcript saved as `.md` file with timestamp
+## Long meetings (over an hour)
 
-## Output Format
+- **Recording is cheap.** Audio is written straight to disk as it arrives (about 1.9 MB per minute, ~115 MB per hour). Nothing accumulates in memory, and the WAV header is refreshed every 2 seconds, so even a power cut leaves a playable file up to the last couple of seconds.
+- **The WAV is on disk before transcription starts.** If transcription fails or you abort it with a second Ctrl+C, the audio is kept and the message tells you the exact `--from-file` command to retry.
+- **Transcription is chunked.** Recordings over 15 minutes are processed in ~10 minute pieces, cut at the quietest moment near each boundary, so memory stays flat however long the meeting was.
+- **Processing time is the real cost.** It scales with the length of the meeting and the model size. See the measurements below; on slow hardware prefer `--model base` (or `tiny`) for meetings, or record now and run `--from-file` later.
 
-Transcripts are saved in markdown format:
+### Measured on a Raspberry Pi (4 cores, CPU only)
+
+A 17.5 minute recording, run through the real pipeline:
+
+| Run | Wall time | Speed | Peak memory |
+|---|---|---|---|
+| `--model base` | 8 min 7 s | 0.46x real-time | 805 MB |
+| `--model tiny --speakers 2` | 8 min 57 s | 0.51x real-time | 843 MB |
+| ...of which speaker identification alone | 4 min 48 s | 0.27x real-time | 350 MB |
+| ...of which `tiny` Whisper with word timestamps | 4 min 14 s | 0.24x real-time | |
+
+Both stages scale roughly linearly with length, so a 2-hour meeting should take about 55 minutes with `--model base`, and about an hour with `tiny` plus speaker labels (extrapolated, not measured at that length). `--model small` is much slower: on a 55 s clip with speaker labels it ran at about 1.3x real-time, which would be well over two hours for a two-hour meeting. Word timestamps (needed for `--srt` and `--diarize`) add noticeable time on top of plain transcription.
+
+Memory grows only with the 16-bit audio kept for processing (about 115 MB per hour), not with the number of chunks.
+
+## Output format
 
 ```markdown
 # Voice Recording Transcript
 
-**Recorded:** 2024-01-15 14:30:25  
-**Model:** faster-whisper small  
+**Recorded:** 2026-10-16 22:48:48  
+**Duration:** 01:12:05  
+**Model:** faster-whisper small + speaker diarization  
+**Audio:** [2026-10-16_22-48-48.wav](2026-10-16_22-48-48.wav)  
+**Captions:** [2026-10-16_22-48-48.srt](2026-10-16_22-48-48.srt)  
 
 ---
 
 [transcribed text here]
 ```
 
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | No microphone found / audio capture failed / unreadable input file |
+| 2 | Disk full / I/O error saving output |
+| 3 | Invalid model size / model load failed |
+| 4 | Transcription failed (the audio is kept) |
+| 130 | Interrupted while processing (the audio is kept) |
+
+## Architecture
+
+```
+src/voice_recorder_cli.py
+├── WavWriter / LinearResampler / read_wav_as_16k_mono   # WAV streaming + loading
+├── AudioRecorder   # sounddevice callback -> queue -> writer thread -> .wav (+ live level snapshot)
+├── plan_chunks / Transcriber   # chunked faster-whisper transcription with progress
+├── Diarizer        # sherpa-onnx speaker turns
+├── label_words / group_utterances   # word-level speaker alignment
+├── build_cues / render_srt          # caption cues -> SubRip
+├── RichUI / PlainUI / RecordingView # live display, progress bars, plain fallback
+└── VoiceRecorder   # the app: record -> save wav -> transcribe -> write md/srt
+```
+
+## Tests
+
+```bash
+pip install pytest
+python -m pytest                       # everything (a couple of minutes on a Raspberry Pi)
+python -m pytest -m "not slow and not integration"   # fast unit tests only
+```
+
+The suite uses a fake microphone and a fake Whisper model for the logic (WAV streaming and crash recovery, chunk planning, speaker alignment, SRT formatting, the UI), plus integration tests that run the real models on public two-speaker clips. Those download test clips and need the Whisper `tiny` model cached; they are skipped when it is not available. SRT output is also checked with `ffmpeg` when installed.
+
 ## Troubleshooting
 
 ### "No input devices found"
 
-This means no microphone is detected. Check:
-- Microphone is connected and enabled in system settings
-- Audio drivers are installed
-- You're running with appropriate permissions (especially on Linux)
+No microphone detected. Check that it is connected and enabled in system settings, the audio drivers are installed, and you have permission to use it (especially on Linux).
 
-### Transcription fails silently
+### The live display warns "No input signal"
 
-The tool continues recording even if transcription fails. Check the exit code to see what happened.
+Audio is arriving but silent: the mic is muted, the wrong device is selected, or the input gain is zero.
+
+### Transcription fails or is interrupted
+
+Your audio is already saved. Re-run with the `--from-file` command that was printed.
 
 ### Slow performance
 
-Use a smaller model: `transcripter --model tiny` for faster processing.
+Use a smaller model (`--model tiny` or `base`). Speaker labels add time on top of transcription.
 
 ## License
 

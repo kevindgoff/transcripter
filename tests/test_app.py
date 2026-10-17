@@ -6,8 +6,6 @@ import sys
 import tempfile
 import threading
 import time
-import wave
-from argparse import Namespace
 
 import numpy as np
 import pytest

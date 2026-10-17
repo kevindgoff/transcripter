@@ -9,16 +9,18 @@ Every recording is saved next to its transcript, sharing one base name:
 
     2026-10-16_22-48-48.wav   the audio (streamed to disk while recording)
     2026-10-16_22-48-48.md    the transcript
+    2026-10-16_22-48-48.srt   closed captions (with --srt)
 
 Usage:
     voice-record [--output-dir DIR] [--model SIZE] [--diarize] [--speakers N]
-                 [--no-audio] [--from-file WAV]
+                 [--srt] [--no-audio] [--no-ui] [--from-file WAV]
 
 Examples:
     voice-record                          # Record with default settings
     voice-record --output-dir ./notes     # Save to custom directory
     voice-record --model medium           # Use larger model for better accuracy
     voice-record --diarize --speakers 2   # Label two speakers
+    voice-record --srt                    # Also write closed captions
     voice-record --from-file meeting.wav  # Transcribe an existing recording
 """
 
@@ -784,12 +786,303 @@ def format_utterances(utterances: list[Utterance]) -> str:
 
 
 # --------------------------------------------------------------------------
-# Terminal UI (plain text; a richer one is added on top of this interface)
+# Captions (SubRip .srt)
 # --------------------------------------------------------------------------
+
+SRT_MAX_CHARS = 42            # per line: the usual broadcast / streaming limit
+SRT_MAX_LINES = 2
+SRT_MAX_DURATION_MS = 7000    # longest a single cue stays on screen
+SRT_MIN_DURATION_MS = 1000    # shortest we try to leave a cue up (if the next cue allows)
+SRT_MIN_SPAN_MS = 200         # hard floor: a cue is never shorter than this
+SRT_GAP_BREAK_MS = 1500       # a pause this long always starts a new cue
+_SENTENCE_END = (".", "?", "!", "…")
+_CLAUSE_END = (",", ";", ":", "—")
+
+
+@dataclass
+class Cue:
+    start_ms: int
+    end_ms: int
+    lines: list[str]
+
+
+def format_srt_timestamp(ms: int) -> str:
+    """HH:MM:SS,mmm. Takes integer milliseconds, so rounding can never produce
+    an invalid '00:00:60,000'."""
+    ms = max(0, int(ms))
+    h, rem = divmod(ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def wrap_caption(text: str, max_chars: int = SRT_MAX_CHARS, max_lines: int = SRT_MAX_LINES) -> list[str] | None:
+    """Split `text` into at most `max_lines` balanced lines of at most `max_chars`.
+    Returns None when it cannot fit."""
+    words = text.split()
+    if not words:
+        return []
+    if len(" ".join(words)) <= max_chars:
+        return [" ".join(words)]
+    lines: list[str] = []
+    cur = ""
+    for w in words:
+        if not cur:
+            cur = w
+        elif len(cur) + 1 + len(w) <= max_chars:
+            cur += " " + w
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    if len(lines) > max_lines or any(len(line) > max_chars for line in lines):
+        return None
+    if len(lines) == 2:  # greedy fills line 1; rebalance so the two lines are similar in length
+        best = None
+        for i in range(1, len(words)):
+            a, b = " ".join(words[:i]), " ".join(words[i:])
+            if len(a) <= max_chars and len(b) <= max_chars and (best is None or max(len(a), len(b)) < best[0]):
+                best = (max(len(a), len(b)), [a, b])
+        if best:
+            lines = best[1]
+    return lines
+
+
+def build_cues(words: list[LabeledWord], max_chars: int = SRT_MAX_CHARS, max_lines: int = SRT_MAX_LINES,
+               max_duration_ms: int = SRT_MAX_DURATION_MS, min_duration_ms: int = SRT_MIN_DURATION_MS,
+               gap_break_ms: int = SRT_GAP_BREAK_MS, max_end_ms: int | None = None) -> list[Cue]:
+    """Turn timed words into caption cues.
+
+    A cue ends at a change of speaker, a long pause, a sentence end (once it has a
+    reasonable amount of text), a clause end (once it is mostly full), or when
+    adding another word would exceed the line / duration limits. When speakers are
+    known, the first cue of each turn is prefixed with "Speaker N: ". Cues never
+    overlap and are never shorter than SRT_MIN_SPAN_MS.
+    """
+    unset = object()
+    state = {"last_speaker": unset}
+    raw: list[list] = []  # [start_ms, end_ms, lines]
+
+    def clean(w: LabeledWord) -> str:
+        return w.text.strip().replace("-->", "->")
+
+    def prefix_for(group: list[LabeledWord]) -> str:
+        sp = group[0].speaker
+        return f"Speaker {sp}: " if sp is not None and sp != state["last_speaker"] else ""
+
+    def text_of(group: list[LabeledWord]) -> str:
+        return " ".join(t for t in (clean(w) for w in group) if t)
+
+    def fits(group: list[LabeledWord]) -> bool:
+        return len(group) == 1 or wrap_caption(prefix_for(group) + text_of(group), max_chars, max_lines) is not None
+
+    cur: list[LabeledWord] = []
+
+    def flush() -> None:
+        if not cur:
+            return
+        text = prefix_for(cur) + text_of(cur)
+        lines = wrap_caption(text, max_chars, max_lines) or [text]
+        raw.append([sec_to_ms(cur[0].start), sec_to_ms(cur[-1].end), lines])
+        state["last_speaker"] = cur[0].speaker
+        cur.clear()
+
+    for w in words:
+        if not clean(w):
+            continue
+        if cur:
+            prev = cur[-1]
+            hard = (
+                w.speaker != prev.speaker
+                or sec_to_ms(w.start) - sec_to_ms(prev.end) > gap_break_ms
+                or sec_to_ms(w.end) - sec_to_ms(cur[0].start) > max_duration_ms
+                or not fits(cur + [w])
+            )
+            soft = False
+            if not hard:
+                size, tail = len(text_of(cur)), clean(prev)
+                soft = (tail.endswith(_SENTENCE_END) and size >= 20) or (
+                    tail.endswith(_CLAUSE_END) and size >= 0.6 * max_chars * max_lines)
+            if hard or soft:
+                flush()
+        cur.append(w)
+    flush()
+
+    # Timing clean-up, in integer milliseconds.
+    for i, c in enumerate(raw):
+        nxt = raw[i + 1][0] if i + 1 < len(raw) else None
+        if nxt is not None and c[1] > nxt:          # never run into the next cue
+            c[1] = nxt
+        want = c[0] + min_duration_ms               # leave it up long enough to read, if there is room
+        if c[1] < want:
+            c[1] = min(want, nxt) if nxt is not None else want
+    prev_end = 0
+    for c in raw:                                   # final pass: guarantee valid, ordered, non-overlapping
+        c[0] = max(c[0], prev_end, 0)
+        c[1] = max(c[1], c[0] + SRT_MIN_SPAN_MS)
+        prev_end = c[1]
+    cues = [Cue(a, b, lines) for a, b, lines in raw]
+    if max_end_ms is not None:
+        cues = [Cue(c.start_ms, min(c.end_ms, max_end_ms), c.lines) for c in cues if c.start_ms < max_end_ms]
+    return cues
+
+
+def render_srt(cues: list[Cue]) -> str:
+    """SubRip text: index, 'start --> end', the lines, a blank line. CRLF line
+    endings (the original SubRip convention; every player accepts them)."""
+    return "".join(
+        f"{i}\r\n{format_srt_timestamp(c.start_ms)} --> {format_srt_timestamp(c.end_ms)}\r\n"
+        + "\r\n".join(c.lines) + "\r\n\r\n"
+        for i, c in enumerate(cues, 1)
+    )
+
+
+def write_srt(path: Path, cues: list[Cue]) -> None:
+    write_text_atomic(path, render_srt(cues), newline="")  # newline="": keep our CRLFs as written
+
+
+# --------------------------------------------------------------------------
+# Terminal UI
+# --------------------------------------------------------------------------
+
+# -- level / spectrum maths (pure, so they can be tested without a terminal) --
+
+def to_dbfs(x: float, floor_db: float = -60.0) -> float:
+    """Linear amplitude (0..1 of full scale) -> dBFS, never below `floor_db`."""
+    import math
+
+    return floor_db if x <= 0 else max(floor_db, 20.0 * math.log10(x))
+
+
+def level_fraction(db: float, floor_db: float = -60.0) -> float:
+    """dBFS -> 0..1 meter position (floor_db is empty, 0 dBFS is full)."""
+    return min(1.0, max(0.0, (db - floor_db) / -floor_db))
+
+
+def spectrum_bands(samples, sample_rate: int = TARGET_RATE, n_bands: int = 16, fmin: float = 100.0,
+                   fmax: float = 7000.0, floor_db: float = -80.0, ceil_db: float = -20.0) -> list[float]:
+    """Log-spaced spectrum of `samples` (floats in [-1, 1]) as `n_bands` values in 0..1."""
+    import numpy as np
+
+    x = np.asarray(samples, dtype=np.float32)
+    if len(x) < 256:
+        return [0.0] * n_bands
+    window = np.hanning(len(x)).astype(np.float32)
+    amp = np.abs(np.fft.rfft(x * window)) / (window.sum() / 2.0)  # a full-scale sine reads 1.0
+    freqs = np.fft.rfftfreq(len(x), 1.0 / sample_rate)
+    edges = np.geomspace(fmin, min(fmax, sample_rate / 2 * 0.99), n_bands + 1)
+    out = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        band = amp[(freqs >= lo) & (freqs < hi)]
+        peak = float(band.max()) if band.size else 0.0
+        db = 20.0 * np.log10(max(peak, 1e-9))
+        out.append(float(min(1.0, max(0.0, (db - floor_db) / (ceil_db - floor_db)))))
+    return out
+
+
+_GRADIENT = [(0.0, (0, 210, 106)), (0.6, (255, 212, 0)), (1.0, (255, 59, 48))]  # green -> yellow -> red
+
+
+def gradient_color(f: float) -> str:
+    """0..1 -> '#rrggbb' along green -> yellow -> red."""
+    f = min(1.0, max(0.0, f))
+    for (f0, c0), (f1, c1) in zip(_GRADIENT, _GRADIENT[1:]):
+        if f <= f1:
+            t = (f - f0) / (f1 - f0)
+            r, g, b = (round(a + (b2 - a) * t) for a, b2 in zip(c0, c1))
+            return f"#{r:02x}{g:02x}{b:02x}"
+    return "#ff3b30"
+
+
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def render_header(elapsed: float, device: str = "", blink_on: bool = True):
+    from rich.text import Text
+
+    t = Text()
+    t.append("● REC" if blink_on else "○ REC", style="bold red" if blink_on else "dim red")
+    t.append("  ")
+    t.append(format_clock(elapsed), style="bold white")
+    if device:
+        t.append(f"   {device}", style="dim")
+    return t
+
+
+def render_meter(fraction: float, db: float, width: int = 40):
+    """A horizontal level meter whose cells run green -> yellow -> red."""
+    from rich.text import Text
+
+    t = Text("Level  ")
+    for i in range(width):
+        pos = (i + 0.5) / width
+        if pos <= fraction:
+            t.append("█", style=gradient_color(pos))
+        else:
+            t.append("░", style="grey30")
+    t.append(f"  {db:6.1f} dB", style=gradient_color(fraction))
+    return t
+
+
+def render_spectrum(bands: list[float], rows: int = 4):
+    """Vertical bars, `rows` characters tall, coloured green at the bottom to red at the top."""
+    from rich.text import Text
+
+    t = Text()
+    for r in range(rows - 1, -1, -1):
+        t.append("       ")
+        for b in bands:
+            cells = min(8, max(0, round(b * rows * 8) - r * 8))
+            t.append(_BLOCKS[cells] * 2, style=gradient_color((r + 1) / rows) if cells else "")
+            t.append(" ")
+        if r:
+            t.append("\n")
+    return t
+
+
+class RecordingView:
+    """Builds one frame of the live recording display from a recorder snapshot."""
+
+    SILENCE_WARN_S = 3.0
+
+    def __init__(self, recorder, n_bands: int = 16, rows: int = 4, meter_width: int = 40):
+        self.recorder = recorder
+        self.n_bands, self.rows, self.meter_width = n_bands, rows, meter_width
+        self._bands = [0.0] * n_bands
+        self._level = 0.0
+
+    def __call__(self):
+        from rich.console import Group
+        from rich.text import Text
+
+        s = self.recorder.snapshot()
+        peak_db = to_dbfs(s.peak)
+        # Fast attack, slow decay: it reads like a real meter instead of flickering.
+        self._level = max(level_fraction(peak_db), self._level * 0.9)
+        raw = spectrum_bands(s.samples, TARGET_RATE, self.n_bands)
+        self._bands = [max(r, old * 0.82) for r, old in zip(raw, self._bands)]
+
+        parts = [
+            render_header(s.elapsed, getattr(self.recorder, "device_name", ""), int(s.elapsed * 2) % 2 == 0),
+            render_meter(self._level, peak_db, self.meter_width),
+            render_spectrum(self._bands, self.rows),
+        ]
+        if s.silent_for >= self.SILENCE_WARN_S:
+            parts.append(Text(f"⚠  No input signal for {int(s.silent_for)}s - is the microphone connected and unmuted?",
+                              style="bold yellow"))
+        elif s.clipped:
+            parts.append(Text("⚠  Clipping - move back from the mic or lower the input gain", style="bold red"))
+        if s.dropouts:
+            parts.append(Text(f"{s.dropouts} audio dropout{'s' if s.dropouts != 1 else ''} reported by the device", style="dim"))
+        parts.append(Text("Press Ctrl+C to stop and transcribe", style="dim"))
+        return Group(*parts)
+
+
+# -- UIs -------------------------------------------------------------------------
 
 class PlainUI:
     """Line-oriented output. Used when stdout is not a terminal (pipes, cron,
-    tests) or when the user passes --no-ui."""
+    tests), when `rich` is missing, or when the user passes --no-ui."""
 
     def banner(self) -> None:
         print("=" * 60)
@@ -826,8 +1119,76 @@ class PlainUI:
         print(f"  {label}: done in {time.monotonic() - t0:.1f}s")
 
 
-def make_ui(no_ui: bool = False):
-    return PlainUI()
+class RichUI(PlainUI):
+    """Colourful live display while recording, real progress bars while processing."""
+
+    REFRESH_HZ = 15
+
+    def __init__(self, console=None):
+        from rich.console import Console
+
+        self.console = console or Console()
+
+    def banner(self) -> None:
+        self.console.rule("[bold cyan]Voice Recorder[/bold cyan] - real-time transcription", style="cyan")
+
+    def info(self, msg: str) -> None:
+        self.console.print(msg, markup=False, highlight=False)
+
+    def warn(self, msg: str) -> None:
+        self.console.print(f"Warning: {msg}", style="yellow", markup=False, highlight=False)
+
+    def record(self, recorder, stop_event: threading.Event) -> None:
+        from rich.live import Live
+
+        view = RecordingView(recorder)
+        with Live(get_renderable=view, console=self.console, refresh_per_second=self.REFRESH_HZ, transient=True):
+            while not stop_event.wait(timeout=0.1):
+                pass
+        self.console.print(f"■ Recording stopped at {format_clock(recorder.elapsed())}", style="bold", markup=False)
+
+    @contextmanager
+    def progress(self, label: str, total: float):
+        from rich.progress import (BarColumn, Progress, ProgressColumn, SpinnerColumn, TaskProgressColumn,
+                                   TextColumn, TimeElapsedColumn, TimeRemainingColumn)
+        from rich.text import Text
+
+        class AudioClock(ProgressColumn):
+            def render(self, task):
+                return Text(f"{format_clock(task.completed)} / {format_clock(task.total or 0)}", style="cyan")
+
+        class Speed(ProgressColumn):
+            def render(self, task):
+                elapsed = task.elapsed or 0.0
+                if elapsed < 1.0 or task.completed <= 0:
+                    return Text("")
+                return Text(f"{task.completed / elapsed:.1f}x realtime", style="magenta")
+
+        total = total if total > 0 else 1.0
+        with Progress(
+            SpinnerColumn(style="cyan"), TextColumn("[bold]{task.description}"),
+            BarColumn(bar_width=None, complete_style="green", finished_style="bright_green"),
+            TaskProgressColumn(), AudioClock(), Speed(), TimeElapsedColumn(), TimeRemainingColumn(),
+            console=self.console, transient=False,
+        ) as bar:
+            task = bar.add_task(label, total=total)
+            yield lambda done: bar.update(task, completed=min(max(done, 0.0), total))
+            bar.update(task, completed=total)
+
+
+def make_ui(no_ui: bool = False, console=None):
+    """RichUI on an interactive terminal (if `rich` is installed), else PlainUI."""
+    if no_ui:
+        return PlainUI()
+    try:
+        from rich.console import Console
+    except ImportError:
+        return PlainUI()
+    if console is None:
+        console = Console()
+        if not console.is_terminal or console.is_dumb_terminal:
+            return PlainUI()
+    return RichUI(console)
 
 
 # --------------------------------------------------------------------------
@@ -845,12 +1206,14 @@ class VoiceRecorder:
         self._model_size = "small"
         self._output_dir = Path.cwd()
         self._save_audio = True
+        self._srt = False
         self._stop_event = threading.Event()
 
     def setup(self, args):
         self._output_dir = Path(args.output_dir).expanduser() if getattr(args, "output_dir", None) else Path.cwd()
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._save_audio = not getattr(args, "no_audio", False)
+        self._srt = getattr(args, "srt", False)
         self.ui.info(f"Output directory: {self._output_dir}")
 
         self._model_size = (getattr(args, "model", None) or "small").lower()
@@ -880,7 +1243,8 @@ class VoiceRecorder:
         """16 kHz mono int16 samples -> transcript (speaker-labelled if a diarizer is active)."""
         duration = len(samples) / TARGET_RATE
         with self.ui.progress("Transcribing", duration) as progress:
-            segments = self.transcriber.transcribe(samples, word_timestamps=self.diarizer is not None, progress=progress)
+            segments = self.transcriber.transcribe(
+                samples, word_timestamps=self.diarizer is not None or self._srt, progress=progress)
 
         turns = None
         if self.diarizer is not None:
@@ -903,7 +1267,22 @@ class VoiceRecorder:
 
     # -- output ------------------------------------------------------------
 
-    def save_transcript(self, result: Result, outputs: Outputs, recorded_at: datetime, audio_ref: str | None = None):
+    def save_captions(self, result: Result, outputs: Outputs):
+        """Write the .srt next to the .md. Returns its path, or None if there is nothing to caption."""
+        cues = build_cues(result.words, max_end_ms=sec_to_ms(result.duration))
+        if not cues:
+            self.ui.warn("no speech to caption; no .srt written.")
+            return None
+        try:
+            write_srt(outputs.srt, cues)
+        except OSError as e:
+            self.ui.info(f"Error saving captions: {e}")
+            sys.exit(2)
+        self.ui.info(f"✓ Captions saved to: {outputs.srt} ({len(cues)} cues)")
+        return outputs.srt
+
+    def save_transcript(self, result: Result, outputs: Outputs, recorded_at: datetime, audio_ref: str | None = None,
+                        captions_ref: str | None = None):
         if not result.body.strip():
             self.ui.warn("No speech detected; nothing saved.")
             return None
@@ -917,6 +1296,8 @@ class VoiceRecorder:
         ]
         if audio_ref:
             header.append(f"**Audio:** [{Path(audio_ref).name}]({audio_ref})  ")
+        if captions_ref:
+            header.append(f"**Captions:** [{captions_ref}]({captions_ref})  ")
         md_content = "\n".join(header) + "\n\n---\n\n" + result.body + "\n"
         try:
             write_text_atomic(outputs.md, md_content)
@@ -1009,7 +1390,8 @@ class VoiceRecorder:
         try:
             result = self.process(samples)
             self.ui.info(f"Transcription complete: {len(result.body)} characters")
-            self.save_transcript(result, outputs, recorded_at, audio_ref)
+            srt_path = self.save_captions(result, outputs) if self._srt else None
+            self.save_transcript(result, outputs, recorded_at, audio_ref, srt_path.name if srt_path else None)
         except KeyboardInterrupt:
             self.ui.info("\nInterrupted.")
             self._audio_safe_hint(keep_audio)
@@ -1073,8 +1455,16 @@ Exit codes: 0 ok, 1 no mic / unreadable input, 2 cannot write output,
         help="Number of speakers, if known (much more reliable than auto-detect; implies --diarize)",
     )
     parser.add_argument(
+        "--srt", action="store_true",
+        help="Also write <timestamp>.srt (closed-caption file) next to the transcript",
+    )
+    parser.add_argument(
         "--no-audio", action="store_true",
         help="Do not keep the recorded .wav (default: save it next to the transcript)",
+    )
+    parser.add_argument(
+        "--no-ui", action="store_true",
+        help="Plain text output: no colours, live meter or progress bars (automatic when output is not a terminal)",
     )
     parser.add_argument(
         "--from-file", type=str, default=None, metavar="WAV",
@@ -1088,7 +1478,7 @@ Exit codes: 0 ok, 1 no mic / unreadable input, 2 cannot write output,
     if args.from_file and not Path(args.from_file).expanduser().is_file():
         parser.error(f"--from-file: no such file: {args.from_file}")
 
-    app = VoiceRecorder(make_ui())
+    app = VoiceRecorder(make_ui(args.no_ui))
     app.setup(args)
     app.run(args)
 
