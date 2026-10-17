@@ -70,7 +70,8 @@ If a name is already taken, `_1`, `_2`... is appended; nothing is ever overwritt
 |---|---|
 | `--output-dir DIR`, `-o` | Directory for all output files |
 | `--model SIZE`, `-m` | Whisper model: `tiny`, `base`, `small` (default), `medium`, `large` |
-| `--srt` | Also write `<name>.srt` closed captions |
+| `--srt` | Also write `<name>.srt` closed captions (and show them on screen when done) |
+| `--no-preview` | Do not display the caption file after transcribing (shown by default with `--srt`) |
 | `--diarize` | Label speakers (needs `sherpa-onnx`) |
 | `--speakers N`, `-n` | Number of speakers, if known (implies `--diarize`) |
 | `--no-audio` | Do not keep the `.wav` |
@@ -95,6 +96,8 @@ transcripter --srt
 ```
 
 Writes a SubRip file: numbered cues, `HH:MM:SS,mmm --> HH:MM:SS,mmm` timing, UTF-8, CRLF line endings. Cue times start at 0 and match the saved `.wav`. Cues follow standard caption conventions: at most 2 lines of 42 characters, 1-7 seconds on screen, never overlapping, broken at pauses and sentence ends. With `--diarize`, the first cue of each turn starts with `Speaker N:`.
+
+When the file is written, it is displayed on screen as the last thing you see: a table of cue number, start, end and caption text with the exact timestamps from the file, speaker labels in a colour per speaker. On a very long recording only the first cues that fit your terminal are shown, followed by "... N more cues in <file>". Piped or logged output (or `--no-ui`) gets a compact one-line-per-cue listing instead. Add `--no-preview` to skip the display; the file is still written.
 
 ### Speaker labels (`--diarize`)
 
@@ -149,7 +152,7 @@ Memory grows only with the 16-bit audio kept for processing (about 115 MB per ho
 ## Version
 
 ```bash
-transcripter --version     # transcripter 1.0.0
+transcripter --version     # transcripter 1.1.0
 ```
 
 The version is stored in one place: `__version__` near the top of `src/voice_recorder_cli.py`. `setup.py` reads it from there, so the installed package metadata, `--version` and the banner always agree. To release a new version, change that one line (and re-run `pip install -e .` so installed metadata updates).

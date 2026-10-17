@@ -2,6 +2,7 @@
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -23,9 +24,10 @@ def run_main(monkeypatch, *argv):
 
 # ---- version ----------------------------------------------------------------------
 
-def test_version_is_1_0_0_in_a_valid_format():
-    assert v.__version__ == "1.0.0"
+def test_version_is_a_valid_three_part_version_of_at_least_1_0():
+    """Deliberately not pinned to a literal, so a release does not need a test edit."""
     assert re.fullmatch(r"\d+\.\d+\.\d+", v.__version__)
+    assert tuple(int(p) for p in v.__version__.split(".")) >= (1, 0, 0)
 
 
 @pytest.mark.parametrize("flag", ["--version", "-V"])
@@ -66,10 +68,13 @@ def test_installed_package_has_the_same_version_and_a_working_command(tmp_path):
     """Install into a throwaway venv (what the README tells users to do) and check
     that package metadata, `transcripter --version` and __version__ all agree."""
     env_dir = tmp_path / "venv"
+    pkg = tmp_path / "pkg"  # build from a copy: pip builds in-tree and must not litter the repo
+    shutil.copytree(REPO, pkg, ignore=shutil.ignore_patterns("venv", ".git", "build", "*.egg-info", "__pycache__",
+                                                             ".pytest_cache", "tests"))
     subprocess.run([sys.executable, "-m", "venv", str(env_dir)], check=True, timeout=120)
     bindir = env_dir / ("Scripts" if os.name == "nt" else "bin")
     py = bindir / ("python.exe" if os.name == "nt" else "python")
-    r = subprocess.run([str(py), "-m", "pip", "install", "-q", "--no-deps", str(REPO)],
+    r = subprocess.run([str(py), "-m", "pip", "install", "-q", "--no-deps", str(pkg)],
                        capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         pytest.skip(f"could not build/install the package (offline?): {r.stderr[-300:]}")

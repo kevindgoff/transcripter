@@ -307,7 +307,8 @@ def test_cli_in_a_real_terminal_draws_progress_and_a_pipe_gets_plain_text(testda
     import select
 
     clip = testdata("1-two-speakers-en.wav")
-    cmd = [sys.executable, str(Path(v.__file__)), "--from-file", str(clip), "-m", "tiny", "-o", str(tmp_path / "tty")]
+    cmd = [sys.executable, str(Path(v.__file__)), "--from-file", str(clip), "-m", "tiny", "--srt",
+           "-o", str(tmp_path / "tty")]
 
     master, slave = pty.openpty()
     env = {**os.environ, "TERM": "xterm-256color", "COLUMNS": "100", "LINES": "30"}
@@ -334,8 +335,17 @@ def test_cli_in_a_real_terminal_draws_progress_and_a_pipe_gets_plain_text(testda
     assert tty_out.index("\x1b[2J") < tty_out.index("Output directory")  # ...before anything was printed
     plain = strip_ansi(tty_out)
     assert "Transcribing" in plain and "100%" in plain and "Transcript saved" in plain
+    # the caption preview: a bordered table, drawn after the transcript was saved
+    assert "Captions - 1-two-speakers-en.srt" in plain and "╭" in plain and "Start" in plain
+    assert plain.index("Transcript saved") < plain.index("Captions - 1-two-speakers-en.srt")
 
     piped = subprocess.run(cmd[:-1] + [str(tmp_path / "pipe")], capture_output=True, text=True, timeout=180)
     assert piped.returncode == 0
     assert "\x1b" not in piped.stdout                               # no escape codes into pipes / logs
     assert "Transcribing: 100%" in piped.stdout
+    assert "Captions (" in piped.stdout and " --> " in piped.stdout  # compact preview for logs, not the table
+    assert "╭" not in piped.stdout
+
+    quiet = subprocess.run(cmd[:-1] + [str(tmp_path / "quiet"), "--no-preview"], capture_output=True, text=True, timeout=180)
+    assert quiet.returncode == 0 and "Captions (" not in quiet.stdout
+    assert (tmp_path / "quiet" / "1-two-speakers-en.srt").exists()  # --no-preview hides it; the file is still written

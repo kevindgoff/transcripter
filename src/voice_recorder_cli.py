@@ -27,6 +27,7 @@ Examples:
 import argparse
 import os
 import queue
+import re
 import signal
 import struct
 import sys
@@ -46,7 +47,7 @@ TARGET_RATE = 16000  # Whisper and the diarizer both expect 16 kHz mono
 
 # Single source of truth for the version. setup.py reads this line (without
 # importing the module), and `--version` prints it. Bump it here only.
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 # Long recordings are transcribed in chunks so memory stays flat no matter how
 # long the meeting is. Each chunk is cut at the quietest moment near its end.
 CHUNK_SECONDS = 600.0          # target chunk length
@@ -944,6 +945,18 @@ def write_srt(path: Path, cues: list[Cue]) -> None:
     write_text_atomic(path, render_srt(cues), newline="")  # newline="": keep our CRLFs as written
 
 
+def select_preview(cues: list[Cue], budget_lines: int) -> tuple[list[Cue], int]:
+    """The leading cues that fit in `budget_lines` screen lines, and how many were left out.
+    Always shows at least one cue so the preview is never empty."""
+    shown, used = [], 0
+    for c in cues:
+        if shown and used + len(c.lines) > budget_lines:
+            break
+        shown.append(c)
+        used += len(c.lines)
+    return shown, len(cues) - len(shown)
+
+
 # --------------------------------------------------------------------------
 # Terminal UI
 # --------------------------------------------------------------------------
@@ -1090,6 +1103,17 @@ class PlainUI:
     def clear(self) -> None:
         """Wipe the screen at startup. A no-op here: plain output may be a pipe or a log."""
 
+    PLAIN_PREVIEW_LINES = 40
+
+    def show_captions(self, cues: list[Cue], path: Path) -> None:
+        """Show the caption file that was just written (compact, one line per cue)."""
+        shown, hidden = select_preview(cues, self.PLAIN_PREVIEW_LINES)
+        print(f"\nCaptions ({len(cues)} cue{'s' if len(cues) != 1 else ''}) - {path.name}")
+        for i, c in enumerate(shown, 1):
+            print(f"{i:>4}  {format_srt_timestamp(c.start_ms)} --> {format_srt_timestamp(c.end_ms)}  {' / '.join(c.lines)}")
+        if hidden:
+            print(f"      ... {hidden} more cue{'s' if hidden != 1 else ''} in {path.name}")
+
     def banner(self) -> None:
         print("=" * 60)
         print(f"Voice Recorder v{__version__} - Real-time Transcription")
@@ -1137,6 +1161,42 @@ class RichUI(PlainUI):
 
     def clear(self) -> None:
         self.console.clear()  # clears the visible screen and homes the cursor; scrollback is kept
+
+    SPEAKER_COLORS = ["cyan", "magenta", "yellow", "green", "blue", "red"]
+
+    def show_captions(self, cues: list[Cue], path: Path) -> None:
+        from rich import box
+        from rich.table import Table
+        from rich.text import Text
+
+        # Leave room for the title, header, footer and whatever the prompt needs afterwards.
+        shown, hidden = select_preview(cues, max(8, (self.console.height or 30) - 12))
+        n = len(cues)
+        table = Table(
+            title=f"Captions - {path.name} ({n} cue{'s' if n != 1 else ''})", title_style="bold cyan",
+            caption=f"... {hidden} more cue{'s' if hidden != 1 else ''} in {path.name}" if hidden else None,
+            caption_style="dim", box=box.ROUNDED, border_style="cyan", header_style="bold",
+            row_styles=["", "on grey11"], pad_edge=True,
+        )
+        table.add_column("#", justify="right", style="dim", no_wrap=True)
+        table.add_column("Start", style="cyan", no_wrap=True)
+        table.add_column("End", style="cyan", no_wrap=True)
+        table.add_column("Caption", ratio=1, overflow="fold")
+        for i, c in enumerate(shown, 1):
+            text = Text()  # built as Text, never parsed as markup: captions may contain brackets
+            for j, line in enumerate(c.lines):
+                if j:
+                    text.append("\n")
+                m = re.match(r"(Speaker (\d+): )(.*)", line) if j == 0 else None
+                if m:
+                    color = self.SPEAKER_COLORS[(int(m.group(2)) - 1) % len(self.SPEAKER_COLORS)]
+                    text.append(m.group(1), style=f"bold {color}")
+                    text.append(m.group(3))
+                else:
+                    text.append(line)
+            table.add_row(str(i), format_srt_timestamp(c.start_ms), format_srt_timestamp(c.end_ms), text)
+        self.console.print()
+        self.console.print(table)
 
     def banner(self) -> None:
         self.console.rule(f"[bold cyan]Voice Recorder[/bold cyan] [dim]v{__version__}[/dim] - real-time transcription",
@@ -1217,6 +1277,7 @@ class VoiceRecorder:
         self._output_dir = Path.cwd()
         self._save_audio = True
         self._srt = False
+        self._preview = True
         self._stop_event = threading.Event()
 
     def setup(self, args):
@@ -1224,6 +1285,7 @@ class VoiceRecorder:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._save_audio = not getattr(args, "no_audio", False)
         self._srt = getattr(args, "srt", False)
+        self._preview = not getattr(args, "no_preview", False)
         self.ui.info(f"Output directory: {self._output_dir}")
 
         self._model_size = (getattr(args, "model", None) or "small").lower()
@@ -1277,19 +1339,19 @@ class VoiceRecorder:
 
     # -- output ------------------------------------------------------------
 
-    def save_captions(self, result: Result, outputs: Outputs):
-        """Write the .srt next to the .md. Returns its path, or None if there is nothing to caption."""
+    def save_captions(self, result: Result, outputs: Outputs) -> tuple[Path | None, list[Cue]]:
+        """Write the .srt next to the .md. Returns (path, cues); (None, []) if there is nothing to caption."""
         cues = build_cues(result.words, max_end_ms=sec_to_ms(result.duration))
         if not cues:
             self.ui.warn("no speech to caption; no .srt written.")
-            return None
+            return None, []
         try:
             write_srt(outputs.srt, cues)
         except OSError as e:
             self.ui.info(f"Error saving captions: {e}")
             sys.exit(2)
         self.ui.info(f"✓ Captions saved to: {outputs.srt} ({len(cues)} cues)")
-        return outputs.srt
+        return outputs.srt, cues
 
     def save_transcript(self, result: Result, outputs: Outputs, recorded_at: datetime, audio_ref: str | None = None,
                         captions_ref: str | None = None):
@@ -1400,8 +1462,10 @@ class VoiceRecorder:
         try:
             result = self.process(samples)
             self.ui.info(f"Transcription complete: {len(result.body)} characters")
-            srt_path = self.save_captions(result, outputs) if self._srt else None
+            srt_path, cues = self.save_captions(result, outputs) if self._srt else (None, [])
             self.save_transcript(result, outputs, recorded_at, audio_ref, srt_path.name if srt_path else None)
+            if srt_path is not None and self._preview:
+                self.ui.show_captions(cues, srt_path)  # last thing on screen: the file you just made
         except KeyboardInterrupt:
             self.ui.info("\nInterrupted.")
             self._audio_safe_hint(keep_audio)
@@ -1467,6 +1531,10 @@ Exit codes: 0 ok, 1 no mic / unreadable input, 2 cannot write output,
     parser.add_argument(
         "--srt", action="store_true",
         help="Also write <timestamp>.srt (closed-caption file) next to the transcript",
+    )
+    parser.add_argument(
+        "--no-preview", action="store_true",
+        help="Do not display the caption file on screen after transcribing (shown by default with --srt)",
     )
     parser.add_argument(
         "--no-audio", action="store_true",
