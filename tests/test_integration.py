@@ -36,7 +36,10 @@ def test_cli_from_file_with_speakers_writes_labelled_transcript(testdata, models
     )
     assert r.returncode == 0, r.stdout + r.stderr
     md = (out / "1-two-speakers-en.md").read_text(encoding="utf-8")
-    assert "**Speaker 1**" in md and "**Speaker 2**" in md and "speaker diarization" in md
+    transcript_lines = md.splitlines()
+    assert any(line.startswith("**Speaker 1 (") and line.endswith(")**") for line in transcript_lines)
+    assert any(line.startswith("**Speaker 2 (") and line.endswith(")**") for line in transcript_lines)
+    assert "speaker diarization" in md
     assert "pencil" in md.lower()
     assert [p.suffix for p in out.iterdir()] == [".md"]  # input wav is not copied
 

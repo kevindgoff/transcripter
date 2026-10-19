@@ -12,16 +12,18 @@ Every recording is saved next to its transcript, sharing one base name:
     2026-10-16_22-48-48.srt   closed captions (with --srt)
 
 Usage:
-    voice-record [--output-dir DIR] [--model SIZE] [--diarize] [--speakers N]
-                 [--srt] [--no-audio] [--no-ui] [--from-file WAV]
+    transcripter [--output-dir DIR] [--audio-path WAV] [--md-path MD] [--prefix TEXT]
+                 [--model SIZE] [--diarize] [--speakers N] [--srt] [--no-audio]
+                 [--no-ui] [--from-file WAV]
 
 Examples:
-    voice-record                          # Record with default settings
-    voice-record --output-dir ./notes     # Save to custom directory
-    voice-record --model medium           # Use larger model for better accuracy
-    voice-record --diarize --speakers 2   # Label two speakers
-    voice-record --srt                    # Also write closed captions
-    voice-record --from-file meeting.wav  # Transcribe an existing recording
+    transcripter                                      # Record with default settings
+    transcripter --output-dir ./notes                 # Save to custom directory
+    transcripter --md-path ./notes/meeting.md         # WAV saved beside it
+    transcripter --audio-path ./wav/call.wav --md-path ./notes/call.md
+    transcripter --prefix team- --srt                 # Prefix all output filenames
+    transcripter --diarize --speakers 2               # Label two speakers
+    transcripter --from-file meeting.wav              # Transcribe an existing recording
 """
 
 import argparse
@@ -37,6 +39,7 @@ import threading
 import time
 import urllib.request
 import wave
+from urllib.parse import quote
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -47,7 +50,7 @@ TARGET_RATE = 16000  # Whisper and the diarizer both expect 16 kHz mono
 
 # Single source of truth for the version. setup.py reads this line (without
 # importing the module), and `--version` prints it. Bump it here only.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 # Long recordings are transcribed in chunks so memory stays flat no matter how
 # long the meeting is. Each chunk is cut at the quietest moment near its end.
 CHUNK_SECONDS = 600.0          # target chunk length
@@ -148,23 +151,94 @@ def unique_stem(directory: Path, stem: str, suffixes=(".wav", ".md", ".srt")) ->
     return candidate
 
 
+def _output_file_path(value: str | Path, suffix: str, label: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.name:
+        raise ValueError(f"{label} path must name a file")
+    if not path.suffix:
+        path = path.with_suffix(suffix)
+    elif path.suffix.lower() != suffix:
+        raise ValueError(f"{label} path must end in {suffix}: {path}")
+    else:
+        path = path.with_suffix(suffix)
+    return path
+
+
+def _prefix_path(path: Path, prefix: str) -> Path:
+    if "/" in prefix or "\\" in prefix:
+        raise ValueError("filename prefix cannot contain path separators")
+    return path.with_name(prefix + path.name) if prefix else path
+
+
+def _numbered_path(path: Path, n: int) -> Path:
+    return path.with_name(f"{path.stem}_{n}{path.suffix}")
+
+
+def resolve_output_paths(directory: Path, stem: str, audio_path: str | Path | None = None,
+                         md_path: str | Path | None = None, prefix: str = "",
+                         include_audio_in_collision: bool = True) -> "Outputs":
+    """Resolve paired WAV/Markdown destinations, prefix basenames, and avoid overwrites.
+
+    When one path is supplied, its sibling is derived with the corresponding extension.
+    When neither is supplied, use `directory/stem`. For `--from-file`, set
+    `include_audio_in_collision=False`: the input WAV is not an output to reserve.
+    """
+    directory = Path(directory).expanduser()
+    if md_path is not None:
+        md = _output_file_path(md_path, ".md", "Markdown")
+    elif audio_path is not None:
+        md = _output_file_path(audio_path, ".wav", "Audio").with_suffix(".md")
+    else:
+        md = directory / f"{stem}.md"
+
+    if audio_path is not None:
+        wav = _output_file_path(audio_path, ".wav", "Audio")
+    else:
+        wav = md.with_suffix(".wav")
+
+    md, wav = _prefix_path(md, prefix), _prefix_path(wav, prefix)
+    n = 0
+    while True:
+        candidate_md = md if n == 0 else _numbered_path(md, n)
+        candidate_wav = wav if n == 0 else _numbered_path(wav, n)
+        reserved = [candidate_md, candidate_md.with_suffix(".srt")]
+        if include_audio_in_collision:
+            reserved.append(candidate_wav)
+        if not any(path.exists() for path in reserved):
+            break
+        n += 1
+
+    return Outputs(directory, candidate_md.stem, candidate_wav, candidate_md)
+
+
 @dataclass
 class Outputs:
-    """The files belonging to one recording: same directory, same base name."""
+    """The files for a recording; destinations may be in different directories."""
     directory: Path
     stem: str
+    audio_path: Path | None = None
+    md_path: Path | None = None
 
     @property
     def wav(self) -> Path:
-        return self.directory / f"{self.stem}.wav"
+        return self.audio_path or self.directory / f"{self.stem}.wav"
 
     @property
     def md(self) -> Path:
-        return self.directory / f"{self.stem}.md"
+        return self.md_path or self.directory / f"{self.stem}.md"
 
     @property
     def srt(self) -> Path:
-        return self.directory / f"{self.stem}.srt"
+        return self.md.with_suffix(".srt")
+
+
+def markdown_link_target(media_path: Path, md_path: Path) -> str:
+    """A URL-safe link from the Markdown file to a media file, including across folders."""
+    try:
+        relative = os.path.relpath(media_path.resolve(), md_path.parent.resolve())
+    except ValueError:  # e.g. different Windows drives
+        return media_path.resolve().as_uri()
+    return quote(Path(relative).as_posix(), safe="/:-._~")
 
 
 def write_text_atomic(path: Path, text: str, newline: str | None = None) -> None:
@@ -786,7 +860,8 @@ def assign_speakers(segments: list[Segment], turns: list[Turn]) -> list[Utteranc
 
 
 def format_utterances(utterances: list[Utterance]) -> str:
-    return "\n\n".join(f"**Speaker {u.speaker}** ({format_clock(u.start)}): {u.text}" for u in utterances)
+    """Render each speaker/time header separately from the utterance text."""
+    return "\n\n".join(f"**Speaker {u.speaker} ({format_clock(u.start)})**\n\n{u.text}" for u in utterances)
 
 
 # --------------------------------------------------------------------------
@@ -1276,17 +1351,29 @@ class VoiceRecorder:
         self._model_size = "small"
         self._output_dir = Path.cwd()
         self._save_audio = True
+        self._audio_path: Path | None = None
+        self._md_path: Path | None = None
+        self._prefix = ""
         self._srt = False
         self._preview = True
         self._stop_event = threading.Event()
 
     def setup(self, args):
         self._output_dir = Path(args.output_dir).expanduser() if getattr(args, "output_dir", None) else Path.cwd()
-        self._output_dir.mkdir(parents=True, exist_ok=True)
         self._save_audio = not getattr(args, "no_audio", False)
+        audio_path = getattr(args, "audio_path", None)
+        md_path = getattr(args, "md_path", None)
+        self._audio_path = Path(audio_path).expanduser() if audio_path else None
+        self._md_path = Path(md_path).expanduser() if md_path else None
+        self._prefix = getattr(args, "prefix", "")
+        if self._audio_path is None and self._md_path is None:
+            self._output_dir.mkdir(parents=True, exist_ok=True)
         self._srt = getattr(args, "srt", False)
         self._preview = not getattr(args, "no_preview", False)
-        self.ui.info(f"Output directory: {self._output_dir}")
+        if self._audio_path is None and self._md_path is None:
+            self.ui.info(f"Output directory: {self._output_dir}")
+        else:
+            self.ui.info("Using explicit output file path(s).")
 
         self._model_size = (getattr(args, "model", None) or "small").lower()
         self.ui.info(f"Loading faster-whisper model ({self._model_size})...")
@@ -1353,7 +1440,7 @@ class VoiceRecorder:
         self.ui.info(f"✓ Captions saved to: {outputs.srt} ({len(cues)} cues)")
         return outputs.srt, cues
 
-    def save_transcript(self, result: Result, outputs: Outputs, recorded_at: datetime, audio_ref: str | None = None,
+    def save_transcript(self, result: Result, outputs: Outputs, recorded_at: datetime, audio_ref: Path | None = None,
                         captions_ref: str | None = None):
         if not result.body.strip():
             self.ui.warn("No speech detected; nothing saved.")
@@ -1367,9 +1454,14 @@ class VoiceRecorder:
             f"**Model:** faster-whisper {self._model_size}{diarized}  ",
         ]
         if audio_ref:
-            header.append(f"**Audio:** [{Path(audio_ref).name}]({audio_ref})  ")
+            audio_path = Path(audio_ref)
+            label = audio_path.name.replace("[", "\\[").replace("]", "\\]")
+            link = markdown_link_target(audio_path, outputs.md)
+            header.append(f"**Audio:** [{label}]({link})  ")
         if captions_ref:
-            header.append(f"**Captions:** [{captions_ref}]({captions_ref})  ")
+            caption_name = Path(captions_ref).name
+            label = caption_name.replace("[", "\\[").replace("]", "\\]")
+            header.append(f"**Captions:** [{label}]({quote(caption_name, safe='-._~')})  ")
         md_content = "\n".join(header) + "\n\n---\n\n" + result.body + "\n"
         try:
             write_text_atomic(outputs.md, md_content)
@@ -1399,13 +1491,30 @@ class VoiceRecorder:
         if duration < 0.5:
             self.ui.info("Audio too short; nothing to transcribe.")
             return
-        outputs = Outputs(self._output_dir, unique_stem(self._output_dir, path.stem, (".md", ".srt")))
-        audio_ref = path.name if path.resolve().parent == self._output_dir.resolve() else str(path)
-        self._transcribe_and_save(samples, outputs, datetime.now(), audio_ref, None)
+        outputs = resolve_output_paths(
+            self._output_dir, path.stem, md_path=self._md_path, prefix=self._prefix,
+            include_audio_in_collision=False,
+        )
+        try:
+            outputs.md.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.ui.info(f"Error creating output directory: {e}")
+            sys.exit(2)
+        self._transcribe_and_save(samples, outputs, datetime.now(), path, None)
 
     def run_recording(self):
         started = datetime.now()
-        outputs = Outputs(self._output_dir, unique_stem(self._output_dir, started.strftime("%Y-%m-%d_%H-%M-%S")))
+        outputs = resolve_output_paths(
+            self._output_dir, started.strftime("%Y-%m-%d_%H-%M-%S"),
+            audio_path=self._audio_path, md_path=self._md_path, prefix=self._prefix,
+        )
+        try:
+            outputs.md.parent.mkdir(parents=True, exist_ok=True)
+            if self._save_audio:
+                outputs.wav.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.ui.info(f"Error creating output directory: {e}")
+            sys.exit(2)
         if self._save_audio:
             wav_path = outputs.wav
         else:
@@ -1443,7 +1552,7 @@ class VoiceRecorder:
                 self.ui.info(f"\n✓ Audio saved: {wav_path} ({format_clock(seconds)})")
             samples = read_wav_as_16k_mono(wav_path)
             self._transcribe_and_save(
-                samples, outputs, started, outputs.wav.name if self._save_audio else None,
+                samples, outputs, started, outputs.wav if self._save_audio else None,
                 wav_path if self._save_audio else None,
             )
         finally:
@@ -1451,7 +1560,7 @@ class VoiceRecorder:
                 wav_path.unlink(missing_ok=True)
 
     def _transcribe_and_save(self, samples, outputs: Outputs, recorded_at: datetime,
-                             audio_ref: str | None, keep_audio: Path | None):
+                             audio_ref: Path | None, keep_audio: Path | None):
         duration = len(samples) / TARGET_RATE
         if duration > 600:
             self.ui.info(
@@ -1486,15 +1595,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  voice-record                          # Record with default settings
-  voice-record --output-dir ./notes     # Save to custom directory
-  voice-record --model medium           # Use larger model for better accuracy
-  voice-record --diarize --speakers 2   # Label who said what
-  voice-record --from-file meeting.wav  # Transcribe an existing recording
+  transcripter --md-path ./notes/meeting.md
+  transcripter --audio-path ./audio/meeting.wav --md-path ./notes/meeting.md
+  transcripter --prefix team- --diarize --speakers 2
+  transcripter --from-file meeting.wav --md-path ./notes/meeting.md
 
-Each recording is saved as <timestamp>.wav next to <timestamp>.md (use
---no-audio to skip the WAV). The WAV is streamed to disk while you record, so
-long meetings use constant memory and survive a crash.
+With no explicit file paths, outputs use <timestamp>.wav and <timestamp>.md in
+--output-dir (default: current directory). If only one path is given, its
+sibling uses the same directory and stem. --prefix changes filenames only.
+The WAV is streamed to disk while recording, so long meetings survive a crash.
 
 Model sizes (smaller = faster):
   tiny    - ~76MB, very fast but less accurate
@@ -1513,7 +1622,19 @@ Exit codes: 0 ok, 1 no mic / unreadable input, 2 cannot write output,
     )
     parser.add_argument(
         "--output-dir", "-o", type=str, default=None,
-        help="Directory for the .md/.wav files (default: current directory)",
+        help="Default directory for generated files (default: current directory; explicit paths override it)",
+    )
+    parser.add_argument(
+        "--audio-path", type=str, default=None, metavar="PATH",
+        help="Output .wav path (default: same base path as the Markdown transcript)",
+    )
+    parser.add_argument(
+        "--md-path", type=str, default=None, metavar="PATH",
+        help="Output .md path (default: same base path as the audio file)",
+    )
+    parser.add_argument(
+        "--prefix", type=str, default="", metavar="TEXT",
+        help="Prefix each output filename (not its directory)",
     )
     parser.add_argument(
         "--model", "-m", type=str, default=None,
@@ -1557,6 +1678,18 @@ Exit codes: 0 ok, 1 no mic / unreadable input, 2 cannot write output,
         if args.speakers < 1:
             parser.error("--speakers must be >= 1")
         args.diarize = True
+    if args.audio_path and args.no_audio:
+        parser.error("--audio-path cannot be used with --no-audio")
+    if args.audio_path and args.from_file:
+        parser.error("--audio-path cannot be used with --from-file (the input media is kept in place)")
+    try:
+        if args.audio_path:
+            _output_file_path(args.audio_path, ".wav", "Audio")
+        if args.md_path:
+            _output_file_path(args.md_path, ".md", "Markdown")
+        _prefix_path(Path("filename"), args.prefix)
+    except ValueError as e:
+        parser.error(str(e))
     if args.from_file and not Path(args.from_file).expanduser().is_file():
         parser.error(f"--from-file: no such file: {args.from_file}")
 

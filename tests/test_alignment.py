@@ -62,8 +62,7 @@ def test_empty_input():
 
 def test_format_uses_hours_only_when_needed():
     out = v.format_utterances([v.Utterance(1, 59, "early"), v.Utterance(2, 3725, "late")])
-    assert "**Speaker 1** (00:59): early" in out
-    assert "**Speaker 2** (01:02:05): late" in out
+    assert out == "**Speaker 1 (00:59)**\n\nearly\n\n**Speaker 2 (01:02:05)**\n\nlate"
 
 
 def test_plain_text_joins_all_segments():

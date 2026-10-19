@@ -69,6 +69,39 @@ def test_wav_is_on_disk_before_transcription_starts(fake_sd, make_app):
     assert len(seen["wavs"]) == 1
 
 
+def test_explicit_separate_paths_and_prefix_are_used_for_recording(fake_sd, make_app, tmp_path):
+    fake_sd(sine(2.0))
+    audio_path = tmp_path / "media" / "meeting.wav"
+    md_path = tmp_path / "notes" / "minutes.md"
+    app = make_app()
+    app._audio_path = audio_path
+    app._md_path = md_path
+    app._prefix = "team-"
+    sigint_when_recording(app)
+    app.run_recording()
+
+    saved_audio = audio_path.with_name("team-meeting.wav")
+    saved_md = md_path.with_name("team-minutes.md")
+    assert saved_audio.exists() and saved_md.exists()
+    text = saved_md.read_text(encoding="utf-8")
+    assert "**Audio:** [team-meeting.wav](../media/team-meeting.wav)" in text
+
+
+def test_only_md_path_uses_same_stem_for_recorded_audio(fake_sd, make_app, tmp_path):
+    fake_sd(sine(2.0))
+    md_path = tmp_path / "notes" / "minutes.md"
+    app = make_app()
+    app._md_path = md_path
+    app._prefix = "review-"
+    sigint_when_recording(app)
+    app.run_recording()
+
+    audio_path = md_path.with_name("review-minutes.wav")
+    saved_md = md_path.with_name("review-minutes.md")
+    assert audio_path.exists() and saved_md.exists()
+    assert "**Audio:** [review-minutes.wav](review-minutes.wav)" in saved_md.read_text(encoding="utf-8")
+
+
 def test_no_audio_flag_keeps_no_wav_and_no_temp_files(fake_sd, make_app, tmp_path, monkeypatch):
     tmp = tmp_path / "tmp"
     tmp.mkdir()
@@ -151,7 +184,7 @@ def test_from_file_transcribes_any_wav_and_names_output_after_it(make_app, tmp_p
     app.run_from_file(src)
     assert ft.calls[0]["n"] == pytest.approx(32000, abs=3)  # 16 kHz mono by the time it reaches Whisper
     assert [p.name for p in (tmp_path / "notes").iterdir()] == ["meeting.md"]
-    assert f"**Audio:** [meeting.wav]({src})" in (tmp_path / "notes" / "meeting.md").read_text()
+    assert "**Audio:** [meeting.wav](../meeting.wav)" in (tmp_path / "notes" / "meeting.md").read_text()
 
 
 def test_from_file_next_to_its_output_links_by_name_and_never_overwrites(make_app, tmp_path):
@@ -188,7 +221,7 @@ def test_process_labels_speakers_and_shows_both_stages(make_app, capsys):
                                                  v.Word(2, 3, " bye"), v.Word(3, 4, " now")])]
     app = make_app(transcriber=FakeTranscriber(segs), diarizer=FakeDiarizer([v.Turn(0, 2, 0), v.Turn(2, 4, 1)]))
     r = app.process(np.zeros(4 * 16000, dtype=np.int16))
-    assert r.diarized and "**Speaker 1** (00:00): hi there" in r.body and "**Speaker 2** (00:02): bye now" in r.body
+    assert r.diarized and "**Speaker 1 (00:00)**\n\nhi there" in r.body and "**Speaker 2 (00:02)**\n\nbye now" in r.body
     assert app.transcriber.calls[0]["words"] is True  # word timing requested because we diarize
     out = capsys.readouterr().out
     assert "Transcribing" in out and "Identifying speakers" in out and "Found 2 speakers." in out

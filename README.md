@@ -6,7 +6,8 @@ Optionally labels who said what, and writes closed-caption (`.srt`) files.
 ## Features
 
 - **Local processing**: no internet required - transcription happens on your machine
-- **Saves your audio**: every recording is kept as a `.wav` next to its transcript
+- **Saves your audio**: by default a `.wav` is saved alongside the transcript
+- **Custom output paths**: place WAV and Markdown files in separate folders, with an optional filename prefix
 - **Built for long meetings**: audio streams to disk while you record, so memory stays flat and a crash does not lose the meeting
 - **Speaker labels** (`--diarize`): "Speaker 1 / Speaker 2" transcripts
 - **Closed captions** (`--srt`): a standards-compliant SubRip file you can load in any video player
@@ -52,7 +53,10 @@ Python 3.10 or newer. Check it worked: `transcripter --help`.
 
 ```bash
 transcripter                       # record until Ctrl+C, then transcribe
-transcripter --output-dir ~/notes  # where the files go (default: current directory)
+transcripter --output-dir ~/notes  # default destination directory
+transcripter --md-path ~/notes/review.md  # WAV goes beside it: review.wav
+transcripter --audio-path ~/audio/review.wav --md-path ~/notes/review.md
+transcripter --prefix team- --srt  # prefix every output filename
 transcripter --model tiny          # faster, less accurate (tiny, base, small, medium, large)
 ```
 
@@ -64,18 +68,25 @@ Each recording produces files that share one base name:
 2026-10-16_22-48-48.srt   captions (only with --srt)
 ```
 
-If a name is already taken, `_1`, `_2`... is appended; nothing is ever overwritten.
+If a name is already taken, `_1`, `_2`... is appended to the filename(s); nothing is ever overwritten.
+
+`--audio-path` and `--md-path` accept full output filenames (a missing `.wav` or `.md` extension is added). If only one is given, the other file uses the same directory and filename stem with its own extension. If both are given, each file goes to its specified path. The `.srt`, when enabled, is placed beside the Markdown file. Explicit paths override `--output-dir`; relative paths are relative to the current working directory. The Markdown audio link is made relative to the transcript, even when the files are in different folders.
+
+`--prefix TEXT` prepends `TEXT` to each output filename's basename, without changing its directory. It applies to generated names and explicit paths. The prefix must not contain a directory separator.
 
 | Option | What it does |
 |---|---|
-| `--output-dir DIR`, `-o` | Directory for all output files |
+| `--output-dir DIR`, `-o` | Default directory for generated output (explicit file paths override it) |
+| `--audio-path PATH` | Output WAV filename; if used alone, the Markdown file shares its stem and directory |
+| `--md-path PATH` | Output Markdown filename; if used alone, the WAV file shares its stem and directory |
+| `--prefix TEXT` | Prefix each output filename (not its directory) |
 | `--model SIZE`, `-m` | Whisper model: `tiny`, `base`, `small` (default), `medium`, `large` |
 | `--srt` | Also write `<name>.srt` closed captions (and show them on screen when done) |
 | `--no-preview` | Do not display the caption file after transcribing (shown by default with `--srt`) |
 | `--diarize` | Label speakers (needs `sherpa-onnx`) |
 | `--speakers N`, `-n` | Number of speakers, if known (implies `--diarize`) |
-| `--no-audio` | Do not keep the `.wav` |
-| `--from-file WAV` | Transcribe an existing recording instead of using the mic |
+| `--no-audio` | Do not keep the `.wav` (cannot be combined with `--audio-path`) |
+| `--from-file WAV` | Transcribe an existing recording instead of using the mic; cannot be combined with `--audio-path` |
 | `--no-ui` | Plain text output: no colours, no screen clear (automatic when output is piped or not a terminal) |
 | `--version`, `-V` | Print the version and exit |
 
@@ -106,9 +117,13 @@ transcripter --diarize --speakers 2
 ```
 
 ```
-**Speaker 1** (00:00): Hi Sanjay, can you help me understand what Generative AI is?
+**Speaker 1 (00:00)**
 
-**Speaker 2** (00:14): Sure. It refers to models that can generate new content...
+Hi Sanjay, can you help me understand what Generative AI is?
+
+**Speaker 2 (00:14)**
+
+Sure. It refers to models that can generate new content...
 ```
 
 - Runs **locally** after you press Ctrl+C. Two small ONNX models (~30 MB) download to `~/.cache/transcripter/` on first use. No torch, no accounts.
@@ -152,7 +167,7 @@ Memory grows only with the 16-bit audio kept for processing (about 115 MB per ho
 ## Version
 
 ```bash
-transcripter --version     # transcripter 1.1.0
+transcripter --version     # transcripter 1.2.0
 ```
 
 The version is stored in one place: `__version__` near the top of `src/voice_recorder_cli.py`. `setup.py` reads it from there, so the installed package metadata, `--version` and the banner always agree. To release a new version, change that one line (and re-run `pip install -e .` so installed metadata updates).
