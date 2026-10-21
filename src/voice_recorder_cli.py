@@ -27,9 +27,11 @@ Examples:
 """
 
 import argparse
+import math
 import os
 import queue
 import re
+import select
 import signal
 import struct
 import sys
@@ -41,7 +43,7 @@ import urllib.request
 import wave
 from urllib.parse import quote
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -58,6 +60,8 @@ CHUNK_THRESHOLD_SECONDS = 900.0  # recordings up to this length go through in on
 CHUNK_SEARCH_SECONDS = 20.0    # look this far back from the target for a quiet cut point
 
 SIGNAL_PEAK = 0.002  # below this (about -54 dBFS) a block counts as "no signal"
+SILENCE_STOP_AFTER_S = 20.0  # start the auto-stop countdown after this much silence
+SILENCE_STOP_COUNTDOWN_S = 30.0
 
 MODEL_DIR = Path(os.environ.get("TRANSCRIPTER_MODEL_DIR", Path.home() / ".cache" / "transcripter" / "models"))
 _RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
@@ -424,6 +428,124 @@ class LevelSnapshot:
     silent_for: float    # seconds since the signal last rose above SIGNAL_PEAK
     dropouts: int        # audio-device over/underruns reported so far
     clipped: bool
+
+
+@dataclass(frozen=True)
+class SilenceStopStatus:
+    seconds_left: int | None = None
+    cancelled: bool = False
+    should_stop: bool = False
+    cancel_available: bool = False
+
+
+class SilenceStopCountdown:
+    """After sustained silence, count down to stopping; cancellation lasts until audio returns."""
+    SILENCE_AFTER_S = SILENCE_STOP_AFTER_S
+    COUNTDOWN_S = SILENCE_STOP_COUNTDOWN_S
+
+    def __init__(self):
+        self._deadline: float | None = None
+        self._cancelled = False
+
+    def update(self, silent_for: float, now: float | None = None) -> SilenceStopStatus:
+        now = time.monotonic() if now is None else now
+        if silent_for < self.SILENCE_AFTER_S:
+            self._deadline = None
+            self._cancelled = False
+            return SilenceStopStatus()
+        if self._cancelled:
+            return SilenceStopStatus(cancelled=True)
+        if self._deadline is None:
+            self._deadline = now + self.COUNTDOWN_S
+        remaining = self._deadline - now
+        if remaining <= 0:
+            return SilenceStopStatus(seconds_left=0, should_stop=True)
+        return SilenceStopStatus(seconds_left=math.ceil(remaining))
+
+    def cancel(self) -> SilenceStopStatus:
+        if self._deadline is not None:
+            self._deadline = None
+            self._cancelled = True
+        return SilenceStopStatus(cancelled=self._cancelled)
+
+
+class CancelKeyReader:
+    """Temporarily read a single C key without Enter, restoring terminal mode on close."""
+
+    def __init__(self):
+        self._active = False
+        self._windows = False
+        self._msvcrt = None
+        self._fd: int | None = None
+        self._termios = None
+        self._old_attrs = None
+
+    @property
+    def available(self) -> bool:
+        return self._active
+
+    def start(self) -> None:
+        if self._active or not getattr(sys.stdin, "isatty", lambda: False)():
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self._msvcrt = msvcrt
+                self._windows = True
+            else:
+                import termios
+                import tty
+                self._fd = sys.stdin.fileno()
+                self._termios = termios
+                self._old_attrs = termios.tcgetattr(self._fd)
+                tty.setcbreak(self._fd)
+            self._active = True
+        except (OSError, ValueError, AttributeError, ImportError):
+            self.stop()
+
+    def cancel_pressed(self) -> bool:
+        if not self._active:
+            return False
+        if self._windows:
+            while self._msvcrt.kbhit():
+                key = self._msvcrt.getwch()
+                if key and ord(key[0]) in (0, 224):
+                    self._msvcrt.getwch()  # consume the second byte of an extended key
+                elif key.lower() == "c":
+                    return True
+            return False
+        try:
+            if select.select([self._fd], [], [], 0)[0]:
+                return os.read(self._fd, 1).lower() == b"c"
+        except (OSError, ValueError):
+            self.stop()
+        return False
+
+    def stop(self) -> None:
+        if self._termios is not None and self._old_attrs is not None and self._fd is not None:
+            try:
+                self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_attrs)
+            except OSError:
+                pass
+        self._active = False
+        self._termios = self._old_attrs = self._fd = None
+        self._msvcrt = None
+
+
+def poll_silence_stop(recorder, countdown: SilenceStopCountdown, keys: CancelKeyReader,
+                      now: float | None = None) -> SilenceStopStatus:
+    """Advance the silence timer and consume the optional keyboard cancel input."""
+    snapshot = recorder.snapshot()
+    status = countdown.update(snapshot.silent_for, now=now)
+    if status.seconds_left is None or status.should_stop:
+        keys.stop()
+        return status
+    keys.start()
+    if keys.cancel_pressed():
+        status = countdown.cancel()
+        keys.stop()
+        return status
+    return replace(status, cancel_available=keys.available)
 
 
 class AudioRecorder:
@@ -1141,6 +1263,7 @@ class RecordingView:
         self.n_bands, self.rows, self.meter_width = n_bands, rows, meter_width
         self._bands = [0.0] * n_bands
         self._level = 0.0
+        self.auto_stop_status = SilenceStopStatus()
 
     def __call__(self):
         from rich.console import Group
@@ -1158,7 +1281,17 @@ class RecordingView:
             render_meter(self._level, peak_db, self.meter_width),
             render_spectrum(self._bands, self.rows),
         ]
-        if s.silent_for >= self.SILENCE_WARN_S:
+        status = self.auto_stop_status
+        if status.seconds_left is not None:
+            parts.append(Text(f"⚠  No input for {int(s.silent_for)}s. Auto-stop in {status.seconds_left}s.",
+                              style="bold yellow"))
+            if status.cancel_available:
+                parts.append(Text("[C] Cancel countdown", style="bold white on blue"))
+            else:
+                parts.append(Text("(keyboard cancellation unavailable)", style="dim"))
+        elif status.cancelled:
+            parts.append(Text("Auto-stop cancelled; waiting for audio to return.", style="bold yellow"))
+        elif s.silent_for >= self.SILENCE_WARN_S:
             parts.append(Text(f"⚠  No input signal for {int(s.silent_for)}s - is the microphone connected and unmuted?",
                               style="bold yellow"))
         elif s.clipped:
@@ -1200,11 +1333,58 @@ class PlainUI:
     def warn(self, msg: str) -> None:
         print(f"Warning: {msg}")
 
+    POLL_S = 0.1
+
     def record(self, recorder: "AudioRecorder", stop_event: threading.Event) -> None:
         print("Recording... Press Ctrl+C to stop.")
         print("-" * 50)
-        while not stop_event.wait(timeout=0.5):
-            pass
+        countdown, keys = SilenceStopCountdown(), CancelKeyReader()
+        output_is_tty = getattr(sys.stdout, "isatty", lambda: False)()
+        last_remaining = None
+        was_cancelled = False
+        line_active = False
+        auto_stopped = False
+        try:
+            while not stop_event.is_set():
+                status = poll_silence_stop(recorder, countdown, keys)
+                if status.seconds_left is not None:
+                    message = f"No input for {countdown.SILENCE_AFTER_S:g}s; Auto-stop in {status.seconds_left:02d}s."
+                    if status.cancel_available:
+                        message += " Press C to cancel."
+                    elif output_is_tty:
+                        message += " Keyboard cancellation unavailable."
+                    if output_is_tty:
+                        print(f"\r{message:<100}", end="", flush=True)
+                        line_active = True
+                    elif last_remaining is None:
+                        self.info(message)
+                    last_remaining = status.seconds_left
+                    was_cancelled = False
+                else:
+                    if line_active:
+                        print("\r" + " " * 100 + "\r", end="", flush=True)
+                        line_active = False
+                    if status.cancelled and not was_cancelled:
+                        self.info("Auto-stop countdown cancelled; waiting for audio to return.")
+                    elif last_remaining is not None and not status.cancelled:
+                        self.info("Audio detected; auto-stop countdown reset.")
+                    last_remaining = None
+                    was_cancelled = status.cancelled
+                if status.should_stop:
+                    if line_active:
+                        print()
+                        line_active = False
+                    self.info("No audio detected; stopping recording and transcribing.")
+                    stop_event.set()
+                    auto_stopped = True
+                    break
+                stop_event.wait(timeout=self.POLL_S)
+        finally:
+            keys.stop()
+            if line_active:
+                print()
+        if auto_stopped:
+            self.info(f"Recording stopped at {format_clock(recorder.elapsed())}.")
 
     @contextmanager
     def progress(self, label: str, total: float):
@@ -1287,9 +1467,23 @@ class RichUI(PlainUI):
         from rich.live import Live
 
         view = RecordingView(recorder)
-        with Live(get_renderable=view, console=self.console, refresh_per_second=self.REFRESH_HZ, transient=True):
-            while not stop_event.wait(timeout=0.1):
-                pass
+        countdown, keys = SilenceStopCountdown(), CancelKeyReader()
+        auto_stopped = False
+        try:
+            with Live(get_renderable=view, console=self.console, refresh_per_second=self.REFRESH_HZ, transient=True):
+                while not stop_event.is_set():
+                    status = poll_silence_stop(recorder, countdown, keys)
+                    view.auto_stop_status = status
+                    if status.should_stop:
+                        stop_event.set()
+                        auto_stopped = True
+                        break
+                    stop_event.wait(timeout=0.1)
+        finally:
+            keys.stop()
+        if auto_stopped:
+            self.console.print("No audio detected; stopping recording and starting transcription.",
+                               style="bold yellow", markup=False)
         self.console.print(f"■ Recording stopped at {format_clock(recorder.elapsed())}", style="bold", markup=False)
 
     @contextmanager

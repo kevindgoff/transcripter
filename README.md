@@ -96,6 +96,8 @@ The screen is cleared when the app starts, so the recording display is the only 
 
 On a terminal you get a live display: a blinking `● REC`, the elapsed time (`MM:SS`, `HH:MM:SS` past an hour), a green-to-red level meter and 16 frequency bars. If no signal arrives for 3 seconds it warns you ("No input signal - is the microphone connected and unmuted?"), and it flags clipping. Press **Ctrl+C** to stop.
 
+Using the existing signal threshold (peak above about **-54 dBFS**), if the microphone remains silent for **20 seconds**, an automatic **30-second stop countdown** starts. The live display shows a highlighted **[C] Cancel countdown** control—press `C` (no Enter needed) to cancel it. If audio resumes, the countdown clears; after cancellation it will only arm again once audio has returned and silence is detected anew. In non-interactive runs the countdown still stops the recording, but there is no keyboard cancel control.
+
 ### While transcribing
 
 Real progress bars (audio processed / total, speed as a multiple of real-time, elapsed and estimated time remaining) for transcription and, with `--diarize`, for speaker identification. The bar advances as each piece of speech is finished, so it moves in steps rather than smoothly.
