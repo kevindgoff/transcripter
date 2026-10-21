@@ -774,6 +774,7 @@ class Transcriber:
                 if cuda_count is not None and cuda_count() < 1:
                     raise RuntimeError("CTranslate2 reports no CUDA device")
                 self._model = WhisperModel(self.model_size, device="cuda", compute_type="auto")
+                self._warmup_cuda()
                 self.device, self.compute_type = "cuda", "auto"
                 return
             except Exception as e:
@@ -786,6 +787,20 @@ class Transcriber:
             if self.gpu_fallback_reason:
                 raise RuntimeError(f"Failed to load Whisper on CUDA ({self.gpu_fallback_reason}) and CPU fallback: {e}")
             raise RuntimeError(f"Failed to load Whisper model: {e}")
+
+    def _warmup_cuda(self) -> None:
+        """Force one tiny inference now so missing CUDA/cuBLAS libraries fall back before recording."""
+        import numpy as np
+
+        if self._model is None:
+            raise RuntimeError("Whisper model not loaded")
+        segments, _info = self._model.transcribe(
+            np.zeros(TARGET_RATE, dtype=np.float32), task="transcribe", language="en",
+            beam_size=1, vad_filter=False, word_timestamps=False,
+        )
+        # faster-whisper's segment generator is lazy; exhaust it to exercise the CUDA kernels.
+        for _segment in segments:
+            pass
 
     def transcribe(self, samples, word_timestamps: bool = False,
                    progress: ProgressFn = _no_progress,

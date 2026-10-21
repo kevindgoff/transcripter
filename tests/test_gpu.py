@@ -7,8 +7,8 @@ import pytest
 import voice_recorder_cli as v
 
 
-def install_fake_whisper(monkeypatch, cuda_devices=1, gpu_error=None, cpu_error=None):
-    calls = []
+def install_fake_whisper(monkeypatch, cuda_devices=1, gpu_error=None, cpu_error=None, gpu_inference_error=None):
+    calls, inference_calls = [], []
 
     class FakeWhisperModel:
         def __init__(self, model_size, device, compute_type):
@@ -16,7 +16,13 @@ def install_fake_whisper(monkeypatch, cuda_devices=1, gpu_error=None, cpu_error=
             error = gpu_error if device == "cuda" else cpu_error
             if error:
                 raise RuntimeError(error)
-            self.model_size = model_size
+            self.model_size, self.device = model_size, device
+
+        def transcribe(self, samples, **kwargs):
+            inference_calls.append((self.device, len(samples), kwargs))
+            if self.device == "cuda" and gpu_inference_error:
+                raise RuntimeError(gpu_inference_error)
+            return iter(()), None
 
     ctranslate2 = types.ModuleType("ctranslate2")
     ctranslate2.get_cuda_device_count = lambda: cuda_devices
@@ -24,42 +30,55 @@ def install_fake_whisper(monkeypatch, cuda_devices=1, gpu_error=None, cpu_error=
     faster_whisper.WhisperModel = FakeWhisperModel
     monkeypatch.setitem(sys.modules, "ctranslate2", ctranslate2)
     monkeypatch.setitem(sys.modules, "faster_whisper", faster_whisper)
-    return calls
+    return calls, inference_calls
 
 
 def test_cpu_default_keeps_existing_cpu_int8_configuration(monkeypatch):
-    calls = install_fake_whisper(monkeypatch)
+    calls, inference_calls = install_fake_whisper(monkeypatch)
     t = v.Transcriber("tiny")
     t.load_model()
     assert calls == [("tiny", "cpu", "int8")]
+    assert inference_calls == []
     assert t.device == "cpu" and t.compute_type == "int8"
     assert t.gpu_fallback_reason is None
 
 
 def test_gpu_transcription_uses_cuda_when_available(monkeypatch):
-    calls = install_fake_whisper(monkeypatch, cuda_devices=1)
+    calls, inference_calls = install_fake_whisper(monkeypatch, cuda_devices=1)
     t = v.Transcriber("small", use_gpu=True)
     t.load_model()
     assert calls == [("small", "cuda", "auto")]
+    assert inference_calls and inference_calls[0][0:2] == ("cuda", v.TARGET_RATE)
     assert t.device == "cuda" and t.compute_type == "auto"
     assert t.gpu_fallback_reason is None
 
 
 def test_no_cuda_device_falls_back_to_cpu_int8(monkeypatch):
-    calls = install_fake_whisper(monkeypatch, cuda_devices=0)
+    calls, inference_calls = install_fake_whisper(monkeypatch, cuda_devices=0)
     t = v.Transcriber("tiny", use_gpu=True)
     t.load_model()
-    assert calls == [("tiny", "cpu", "int8")]
+    assert calls == [("tiny", "cpu", "int8")] and inference_calls == []
     assert t.device == "cpu" and t.compute_type == "int8"
     assert "no cuda device" in t.gpu_fallback_reason.lower()
 
 
 def test_cuda_initialization_error_retries_whisper_on_cpu(monkeypatch):
-    calls = install_fake_whisper(monkeypatch, cuda_devices=1, gpu_error="CUDA libraries missing")
+    calls, inference_calls = install_fake_whisper(monkeypatch, cuda_devices=1, gpu_error="CUDA libraries missing")
     t = v.Transcriber("tiny", use_gpu=True)
     t.load_model()
     assert calls == [("tiny", "cuda", "auto"), ("tiny", "cpu", "int8")]
+    assert inference_calls == []
     assert t.device == "cpu" and "CUDA libraries missing" in t.gpu_fallback_reason
+
+
+def test_gpu_warmup_inference_failure_falls_back_to_cpu_before_recording(monkeypatch):
+    cublas_error = "Library cublas64_12.dll is not found or cannot be loaded"
+    calls, inference_calls = install_fake_whisper(monkeypatch, cuda_devices=1, gpu_inference_error=cublas_error)
+    t = v.Transcriber("medium", use_gpu=True)
+    t.load_model()
+    assert calls == [("medium", "cuda", "auto"), ("medium", "cpu", "int8")]
+    assert inference_calls and inference_calls[0][0] == "cuda"
+    assert t.device == "cpu" and cublas_error in t.gpu_fallback_reason
 
 
 def test_cpu_load_failure_after_gpu_failure_is_reported(monkeypatch):
