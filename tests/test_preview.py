@@ -223,7 +223,7 @@ def test_no_preview_flag_is_documented_and_reaches_the_app(monkeypatch, capsys):
 
 def test_setup_turns_the_flag_into_app_state(monkeypatch, tmp_path):
     class Quiet:
-        def __init__(self, model_size): pass
+        def __init__(self, model_size, use_gpu=False): pass
         def load_model(self): pass
 
     monkeypatch.setattr(v, "Transcriber", Quiet)

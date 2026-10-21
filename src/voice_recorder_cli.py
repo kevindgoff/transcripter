@@ -13,7 +13,7 @@ Every recording is saved next to its transcript, sharing one base name:
 
 Usage:
     transcripter [--output-dir DIR] [--audio-path WAV] [--md-path MD] [--prefix TEXT]
-                 [--model SIZE] [--diarize] [--speakers N] [--srt] [--no-audio]
+                 [--model SIZE] [--gpu] [--diarize] [--speakers N] [--srt] [--no-audio]
                  [--no-ui] [--from-file WAV]
 
 Examples:
@@ -22,6 +22,7 @@ Examples:
     transcripter --md-path ./notes/meeting.md         # WAV saved beside it
     transcripter --audio-path ./wav/call.wav --md-path ./notes/call.md
     transcripter --prefix team- --srt                 # Prefix all output filenames
+    transcripter --gpu --diarize --speakers 2         # Prefer CUDA; fall back to CPU
     transcripter --diarize --speakers 2               # Label two speakers
     transcripter --from-file meeting.wav              # Transcribe an existing recording
 """
@@ -749,12 +750,16 @@ def plan_chunks(samples, sample_rate: int = TARGET_RATE, chunk_s: float = CHUNK_
 
 
 class Transcriber:
-    """Local transcription using faster-whisper."""
+    """Local transcription using faster-whisper; optionally prefer NVIDIA CUDA."""
 
     VALID_SIZES = ["tiny", "base", "small", "medium", "large"]
 
-    def __init__(self, model_size: str = "small"):
+    def __init__(self, model_size: str = "small", use_gpu: bool = False):
         self.model_size = model_size.lower()
+        self.use_gpu = use_gpu
+        self.device = "cpu"
+        self.compute_type = "int8"
+        self.gpu_fallback_reason: str | None = None
         self._model = None
 
     def load_model(self):
@@ -762,9 +767,24 @@ class Transcriber:
             raise ValueError(f"Invalid size. Must be one of: {', '.join(self.VALID_SIZES)}")
         from faster_whisper import WhisperModel
 
+        if self.use_gpu:
+            try:
+                import ctranslate2
+                cuda_count = getattr(ctranslate2, "get_cuda_device_count", None)
+                if cuda_count is not None and cuda_count() < 1:
+                    raise RuntimeError("CTranslate2 reports no CUDA device")
+                self._model = WhisperModel(self.model_size, device="cuda", compute_type="auto")
+                self.device, self.compute_type = "cuda", "auto"
+                return
+            except Exception as e:
+                self.gpu_fallback_reason = str(e)
+
         try:
             self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
+            self.device, self.compute_type = "cpu", "int8"
         except Exception as e:
+            if self.gpu_fallback_reason:
+                raise RuntimeError(f"Failed to load Whisper on CUDA ({self.gpu_fallback_reason}) and CPU fallback: {e}")
             raise RuntimeError(f"Failed to load Whisper model: {e}")
 
     def transcribe(self, samples, word_timestamps: bool = False,
@@ -848,20 +868,21 @@ def ensure_diarization_models() -> None:
 
 
 class Diarizer:
-    """Finds speaker turns in 16 kHz mono audio."""
+    """Finds speaker turns in 16 kHz mono audio, optionally preferring NVIDIA CUDA."""
 
-    def __init__(self, num_speakers: int | None = None, threshold: float = 0.5, num_threads: int | None = None):
+    def __init__(self, num_speakers: int | None = None, threshold: float = 0.5,
+                 num_threads: int | None = None, use_gpu: bool = False):
         # num_speakers=None -> let the clusterer guess, controlled by `threshold`
         # (lower = more speakers, higher = fewer).
         self.num_speakers = num_speakers
         self.threshold = threshold
         self.num_threads = num_threads or min(4, os.cpu_count() or 1)
+        self.use_gpu = use_gpu
+        self.provider = "cpu"
+        self.gpu_fallback_reason: str | None = None
         self._sd = None
 
-    def load(self) -> None:
-        import sherpa_onnx
-
-        ensure_diarization_models()
+    def _create_session(self, sherpa_onnx, provider: str):
         config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
             segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
                 pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
@@ -873,9 +894,10 @@ class Diarizer:
                     window_shift_ratio=0.25,
                 ),
                 num_threads=self.num_threads,
+                provider=provider,
             ),
             embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                model=str(EMBEDDING_MODEL), num_threads=self.num_threads
+                model=str(EMBEDDING_MODEL), num_threads=self.num_threads, provider=provider
             ),
             clustering=sherpa_onnx.FastClusteringConfig(
                 num_clusters=self.num_speakers or -1, threshold=self.threshold
@@ -884,10 +906,31 @@ class Diarizer:
             min_duration_off=0.5,
         )
         if not config.validate():
-            raise RuntimeError("Invalid diarization config (check model files)")
-        self._sd = sherpa_onnx.OfflineSpeakerDiarization(config)
-        if self._sd.sample_rate != TARGET_RATE:
-            raise RuntimeError(f"Diarizer expects {self._sd.sample_rate} Hz, not {TARGET_RATE}")
+            raise RuntimeError(f"Invalid {provider} diarization config (check models and provider support)")
+        session = sherpa_onnx.OfflineSpeakerDiarization(config)
+        if session.sample_rate != TARGET_RATE:
+            raise RuntimeError(f"Diarizer expects {session.sample_rate} Hz, not {TARGET_RATE}")
+        return session
+
+    def load(self) -> None:
+        import sherpa_onnx
+
+        ensure_diarization_models()
+        if self.use_gpu:
+            sherpa_version = str(getattr(sherpa_onnx, "__version__", ""))
+            if "cuda" not in sherpa_version.lower():
+                self.gpu_fallback_reason = (
+                    f"sherpa-onnx {sherpa_version or '(unknown version)'} is not a CUDA-enabled build"
+                )
+            else:
+                try:
+                    self._sd = self._create_session(sherpa_onnx, "cuda")
+                    self.provider = "cuda"
+                    return
+                except Exception as e:
+                    self.gpu_fallback_reason = str(e)
+        self._sd = self._create_session(sherpa_onnx, "cpu")
+        self.provider = "cpu"
 
     def diarize(self, samples, progress: ProgressFn = _no_progress) -> list[Turn]:
         """Speaker turns for 16 kHz mono int16 `samples`."""
@@ -1548,6 +1591,7 @@ class VoiceRecorder:
         self._audio_path: Path | None = None
         self._md_path: Path | None = None
         self._prefix = ""
+        self._use_gpu = False
         self._srt = False
         self._preview = True
         self._stop_event = threading.Event()
@@ -1560,6 +1604,7 @@ class VoiceRecorder:
         self._audio_path = Path(audio_path).expanduser() if audio_path else None
         self._md_path = Path(md_path).expanduser() if md_path else None
         self._prefix = getattr(args, "prefix", "")
+        self._use_gpu = getattr(args, "gpu", False)
         if self._audio_path is None and self._md_path is None:
             self._output_dir.mkdir(parents=True, exist_ok=True)
         self._srt = getattr(args, "srt", False)
@@ -1572,20 +1617,27 @@ class VoiceRecorder:
         self._model_size = (getattr(args, "model", None) or "small").lower()
         self.ui.info(f"Loading faster-whisper model ({self._model_size})...")
         try:
-            self.transcriber = Transcriber(model_size=self._model_size)
+            self.transcriber = Transcriber(model_size=self._model_size, use_gpu=self._use_gpu)
             self.transcriber.load_model()
         except Exception as e:
             self.ui.info(f"Error loading transcription model: {e}")
             sys.exit(3)
         self.ui.info("✓ Model loaded successfully")
+        if self._use_gpu:
+            if self.transcriber.device == "cuda":
+                self.ui.info("✓ Whisper transcription is using CUDA.")
+            else:
+                self.ui.warn(f"CUDA unavailable for transcription ({self.transcriber.gpu_fallback_reason}); using CPU int8.")
 
         if getattr(args, "diarize", False):
-            self.diarizer = Diarizer(num_speakers=getattr(args, "speakers", None))
+            self.diarizer = Diarizer(num_speakers=getattr(args, "speakers", None), use_gpu=self._use_gpu)
             try:
                 # Load now (not after recording) so a missing model or no
                 # network fails *before* the user has spent time talking.
                 self.diarizer.load()
-                self.ui.info("✓ Speaker diarizer ready")
+                if self.diarizer.gpu_fallback_reason:
+                    self.ui.warn(f"CUDA unavailable for diarization ({self.diarizer.gpu_fallback_reason}); using CPU.")
+                self.ui.info(f"✓ Speaker diarizer ready ({self.diarizer.provider.upper()})")
             except Exception as e:
                 self.ui.warn(f"diarization unavailable ({e}). Continuing without speaker labels.")
                 self.diarizer = None
@@ -1792,6 +1844,7 @@ Examples:
   transcripter --md-path ./notes/meeting.md
   transcripter --audio-path ./audio/meeting.wav --md-path ./notes/meeting.md
   transcripter --prefix team- --diarize --speakers 2
+  transcripter --gpu --diarize --speakers 2  # prefer CUDA; transparently falls back to CPU
   transcripter --from-file meeting.wav --md-path ./notes/meeting.md
 
 With no explicit file paths, outputs use <timestamp>.wav and <timestamp>.md in
@@ -1834,6 +1887,10 @@ Exit codes: 0 ok, 1 no mic / unreadable input, 2 cannot write output,
         "--model", "-m", type=str, default=None,
         choices=["tiny", "base", "small", "medium", "large"],
         help="Whisper model size (default: small)",
+    )
+    parser.add_argument(
+        "--gpu", action="store_true",
+        help="Prefer NVIDIA CUDA for transcription and enabled diarization; fall back to CPU if unavailable",
     )
     parser.add_argument(
         "--diarize", action="store_true",

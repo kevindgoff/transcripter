@@ -57,6 +57,7 @@ transcripter --output-dir ~/notes  # default destination directory
 transcripter --md-path ~/notes/review.md  # WAV goes beside it: review.wav
 transcripter --audio-path ~/audio/review.wav --md-path ~/notes/review.md
 transcripter --prefix team- --srt  # prefix every output filename
+transcripter --gpu --diarize --speakers 2  # prefer CUDA; falls back to CPU
 transcripter --model tiny          # faster, less accurate (tiny, base, small, medium, large)
 ```
 
@@ -81,6 +82,7 @@ If a name is already taken, `_1`, `_2`... is appended to the filename(s); nothin
 | `--md-path PATH` | Output Markdown filename; if used alone, the WAV file shares its stem and directory |
 | `--prefix TEXT` | Prefix each output filename (not its directory) |
 | `--model SIZE`, `-m` | Whisper model: `tiny`, `base`, `small` (default), `medium`, `large` |
+| `--gpu` | Prefer NVIDIA CUDA for transcription and enabled diarization; each stage falls back to CPU if unavailable |
 | `--srt` | Also write `<name>.srt` closed captions (and show them on screen when done) |
 | `--no-preview` | Do not display the caption file after transcribing (shown by default with `--srt`) |
 | `--diarize` | Label speakers (needs `sherpa-onnx`) |
@@ -89,6 +91,12 @@ If a name is already taken, `_1`, `_2`... is appended to the filename(s); nothin
 | `--from-file WAV` | Transcribe an existing recording instead of using the mic; cannot be combined with `--audio-path` |
 | `--no-ui` | Plain text output: no colours, no screen clear (automatic when output is piped or not a terminal) |
 | `--version`, `-V` | Print the version and exit |
+
+### GPU acceleration (`--gpu`)
+
+CPU remains the default. With `--gpu`, faster-whisper asks CTranslate2 to use CUDA; if `--diarize` is also enabled, the segmentation and speaker-embedding ONNX sessions also request CUDA. Each stage reports a warning and falls back to CPU if its GPU runtime or provider cannot initialize. If the entire diarization package is missing, the existing behavior still continues without speaker labels.
+
+This is for compatible NVIDIA CUDA systems, currently the documented Linux/Windows x64 builds. The standard `pip install -e ".[diarize]"` installs the regular CPU sherpa-onnx wheel; GPU diarization needs an official CUDA-enabled `+cuda` wheel and matching CUDA/cuDNN runtime. The app recognizes that build and avoids sending CUDA requests to a CPU-only sherpa-onnx package (which can silently fall back inside the library). Follow the upstream [CTranslate2 GPU requirements](https://opennmt.net/CTranslate2/installation.html) and [sherpa-onnx CUDA Python installation instructions](https://k2-fsa.github.io/sherpa/onnx/python/install.html) for the versions supported by your system. The Pi’s VideoCore GPU and the Mac’s Apple GPU are not CUDA devices, so they continue on CPU; Apple CoreML is not part of this option.
 
 ### While recording
 
