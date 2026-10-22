@@ -201,7 +201,7 @@ Memory grows only with the 16-bit audio kept for processing (about 115 MB per ho
 ## Version
 
 ```bash
-transcripter --version     # transcripter 1.2.0
+transcripter --version     # transcripter 1.3.0
 ```
 
 The version is stored in one place: `__version__` near the top of `src/voice_recorder_cli.py`. `setup.py` reads it from there, so the installed package metadata, `--version` and the banner always agree. To release a new version, change that one line (and re-run `pip install -e .` so installed metadata updates).

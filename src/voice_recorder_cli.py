@@ -53,7 +53,7 @@ TARGET_RATE = 16000  # Whisper and the diarizer both expect 16 kHz mono
 
 # Single source of truth for the version. setup.py reads this line (without
 # importing the module), and `--version` prints it. Bump it here only.
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 # Long recordings are transcribed in chunks so memory stays flat no matter how
 # long the meeting is. Each chunk is cut at the quietest moment near its end.
 CHUNK_SECONDS = 600.0          # target chunk length
