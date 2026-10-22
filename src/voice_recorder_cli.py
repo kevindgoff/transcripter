@@ -14,7 +14,7 @@ Every recording is saved next to its transcript, sharing one base name:
 Usage:
     transcripter [--output-dir DIR] [--audio-path WAV] [--md-path MD] [--prefix TEXT]
                  [--model SIZE] [--gpu] [--diarize] [--speakers N] [--srt] [--no-audio]
-                 [--no-ui] [--from-file WAV]
+                 [--no-live] [--no-ui] [--from-file WAV]
 
 Examples:
     transcripter                                      # Record with default settings
@@ -59,6 +59,22 @@ __version__ = "1.2.0"
 CHUNK_SECONDS = 600.0          # target chunk length
 CHUNK_THRESHOLD_SECONDS = 900.0  # recordings up to this length go through in one piece
 CHUNK_SEARCH_SECONDS = 20.0    # look this far back from the target for a quiet cut point
+
+# Live (background) transcription while recording. The worker cuts the incoming
+# audio at the first pause after LIVE_MIN_CHUNK_S (hard cap LIVE_MAX_CHUNK_S) and
+# transcribes it on a couple of cores at low priority, so little is left to do
+# when the recording stops. If it falls behind it first drops to greedy decoding,
+# then gives up and leaves the rest for the normal after-recording pass.
+LIVE_MIN_CHUNK_S = 30.0
+LIVE_MAX_CHUNK_S = 60.0
+LIVE_PAUSE_S = 0.4            # this much quiet counts as a pause worth cutting at
+LIVE_PAUSE_ABS = 0.003        # frame RMS (full scale = 1.0) always counted as quiet
+LIVE_PAUSE_REL = 0.25         # ...as is anything below this fraction of the median frame RMS
+LIVE_DEGRADE_LAG_S = 120.0    # audio waiting this long -> greedy decoding (beam 1)
+LIVE_DEFER_LAG_S = 240.0      # ...this long, even so -> stop; the rest runs after recording
+LIVE_RECOVER_LAG_S = 50.0     # back to full-quality decoding once lag is below this
+LIVE_FULL_THREADS_TAIL_S = 120.0  # reload the model on all cores if this much is left after stop
+WHISPER_BEAM_SIZE = 5
 
 SIGNAL_PEAK = 0.002  # below this (about -54 dBFS) a block counts as "no signal"
 SILENCE_STOP_AFTER_S = 20.0  # start the auto-stop countdown after this much silence
@@ -559,7 +575,8 @@ class AudioRecorder:
     RING = 2048  # samples kept for the live level/spectrum display
 
     def __init__(self, wav_path: Path, sample_rate: int = TARGET_RATE, channels: int = 1,
-                 on_error: Callable[[], None] | None = None):
+                 on_error: Callable[[], None] | None = None,
+                 on_samples: Callable[[object, int], None] | None = None):
         import numpy as np
 
         self.wav_path = Path(wav_path)
@@ -568,6 +585,7 @@ class AudioRecorder:
         self.device_name = ""
         self.error: str | None = None
         self._on_error = on_error
+        self._on_samples = on_samples  # optional tap: (mono int16 block, sample rate); must be cheap
         self._np = np
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._stream = None
@@ -637,6 +655,14 @@ class AudioRecorder:
                 self.error = str(e)
                 if self._on_error:
                     self._on_error()
+            if self._on_samples is not None and not failed:
+                try:
+                    x = np.frombuffer(block, dtype=np.int16)
+                    if self.channels > 1:
+                        x = x[: len(x) - len(x) % self.channels].reshape(-1, self.channels)[:, 0]
+                    self._on_samples(x, self._actual_rate)
+                except Exception:
+                    self._on_samples = None  # the tap is optional; it must never break recording
 
     def _track(self, x) -> None:
         np = self._np
@@ -681,6 +707,11 @@ class AudioRecorder:
 
     def elapsed(self) -> float:
         return time.monotonic() - self._t0
+
+    @property
+    def dropouts(self) -> int:
+        """Times the audio device reported lost data (overflow)."""
+        return self._dropouts
 
     def snapshot(self) -> LevelSnapshot:
         np = self._np
@@ -754,9 +785,10 @@ class Transcriber:
 
     VALID_SIZES = ["tiny", "base", "small", "medium", "large"]
 
-    def __init__(self, model_size: str = "small", use_gpu: bool = False):
+    def __init__(self, model_size: str = "small", use_gpu: bool = False, cpu_threads: int = 0):
         self.model_size = model_size.lower()
         self.use_gpu = use_gpu
+        self.cpu_threads = cpu_threads  # 0 = library default (all cores)
         self.device = "cpu"
         self.compute_type = "int8"
         self.gpu_fallback_reason: str | None = None
@@ -781,12 +813,25 @@ class Transcriber:
                 self.gpu_fallback_reason = str(e)
 
         try:
-            self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
-            self.device, self.compute_type = "cpu", "int8"
+            self._load_cpu()
         except Exception as e:
             if self.gpu_fallback_reason:
                 raise RuntimeError(f"Failed to load Whisper on CUDA ({self.gpu_fallback_reason}) and CPU fallback: {e}")
             raise RuntimeError(f"Failed to load Whisper model: {e}")
+
+    def _load_cpu(self) -> None:
+        from faster_whisper import WhisperModel
+
+        extra = {"cpu_threads": self.cpu_threads} if self.cpu_threads else {}
+        self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8", **extra)
+        self.device, self.compute_type = "cpu", "int8"
+
+    def set_cpu_threads(self, n: int) -> None:
+        """Reload the CPU model with `n` threads (0 = all cores). No-op on CUDA or if unchanged."""
+        if self._model is None or self.device != "cpu" or n == self.cpu_threads:
+            return
+        self.cpu_threads = n
+        self._load_cpu()
 
     def _warmup_cuda(self) -> None:
         """Force one tiny inference now so missing CUDA/cuBLAS libraries fall back before recording."""
@@ -802,41 +847,266 @@ class Transcriber:
         for _segment in segments:
             pass
 
+    def transcribe_piece(self, samples, offset: float = 0.0, word_timestamps: bool = False,
+                         beam_size: int = WHISPER_BEAM_SIZE, initial_prompt: str | None = None,
+                         progress: ProgressFn = _no_progress) -> list[Segment]:
+        """Transcribe one stretch of 16 kHz mono int16 audio; times are shifted by `offset` seconds.
+
+        `progress` gets seconds finished *within this piece*. Raises whatever the model raises.
+        """
+        extra = {"initial_prompt": initial_prompt} if initial_prompt else {}
+        raw_segments, _info = self._model.transcribe(
+            int16_to_float32(samples),
+            task="transcribe",
+            beam_size=beam_size,
+            vad_filter=True,
+            word_timestamps=word_timestamps,
+            **extra,
+        )
+        out: list[Segment] = []
+        # `raw_segments` is a lazy generator: iterating it *is* the work.
+        for s in raw_segments:
+            out.append(Segment(
+                start=s.start + offset,
+                end=s.end + offset,
+                text=s.text.strip(),
+                words=[Word(w.start + offset, w.end + offset, w.word) for w in (s.words or [])],
+            ))
+            progress(s.end)
+        return out
+
     def transcribe(self, samples, word_timestamps: bool = False,
                    progress: ProgressFn = _no_progress,
-                   chunk_s: float = CHUNK_SECONDS, threshold_s: float = CHUNK_THRESHOLD_SECONDS) -> list[Segment]:
+                   chunk_s: float = CHUNK_SECONDS, threshold_s: float = CHUNK_THRESHOLD_SECONDS,
+                   offset: float = 0.0) -> list[Segment]:
         """Transcribe 16 kHz mono int16 samples (a numpy array).
 
         The array goes straight to faster-whisper (no temp file, no PyAV decode).
         `progress` is called with seconds of audio finished, as segments arrive.
-        Long audio is processed in chunks; timestamps are made absolute.
+        Long audio is processed in chunks; timestamps are made absolute, plus `offset`
+        (the start of `samples` within the whole recording).
         """
         if not self._model:
             raise RuntimeError("Model not loaded")
         try:
             out: list[Segment] = []
             for a, b in plan_chunks(samples, TARGET_RATE, chunk_s, threshold_s=threshold_s):
-                offset = a / TARGET_RATE
-                raw_segments, _info = self._model.transcribe(
-                    int16_to_float32(samples[a:b]),
-                    task="transcribe",
-                    beam_size=5,
-                    vad_filter=True,
-                    word_timestamps=word_timestamps,
+                start = a / TARGET_RATE
+                out += self.transcribe_piece(
+                    samples[a:b], offset=offset + start, word_timestamps=word_timestamps,
+                    progress=lambda done, start=start: progress(start + done),
                 )
-                # `raw_segments` is a lazy generator: iterating it *is* the work.
-                for s in raw_segments:
-                    out.append(Segment(
-                        start=s.start + offset,
-                        end=s.end + offset,
-                        text=s.text.strip(),
-                        words=[Word(w.start + offset, w.end + offset, w.word) for w in (s.words or [])],
-                    ))
-                    progress(out[-1].end)
                 progress(b / TARGET_RATE)
             return out
         except Exception as e:
             raise RuntimeError(f"Transcription failed: {e}")
+
+
+# --------------------------------------------------------------------------
+# Live (background) transcription while recording
+# --------------------------------------------------------------------------
+
+def live_cpu_threads() -> int:
+    """Cores the background worker may use: about half, so recording and the UI keep up."""
+    return max(1, min(4, (os.cpu_count() or 2) // 2))
+
+
+def _lower_thread_priority() -> None:
+    """Be nice to the recorder. Linux only: there nice values are per thread; on macOS the same call
+    would demote the whole process, so there the smaller thread count is the only brake."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)
+    except (OSError, AttributeError):
+        pass
+
+
+def find_live_cut(samples, sample_rate: int = TARGET_RATE, min_s: float = LIVE_MIN_CHUNK_S,
+                  max_s: float = LIVE_MAX_CHUNK_S, pause_s: float = LIVE_PAUSE_S) -> int | None:
+    """Where the next live chunk should end within `samples` (audio waiting to be transcribed).
+
+    Returns None when it is too early. Otherwise the middle of the first pause of at least `pause_s`
+    that starts after `min_s`; failing that, at `max_s` the quietest 50 ms frame of the last 10 s.
+    """
+    import numpy as np
+
+    frame = int(0.05 * sample_rate)
+    n = len(samples) // frame
+    if len(samples) < min_s * sample_rate:
+        return None
+    x = np.asarray(samples[:n * frame], dtype=np.float32) / 32768.0
+    rms = np.sqrt((x.reshape(n, frame) ** 2).mean(axis=1))
+    threshold = max(LIVE_PAUSE_ABS, LIVE_PAUSE_REL * float(np.median(rms)))
+    first = int(min_s * sample_rate) // frame
+    cap = int(max_s * sample_rate) // frame
+    last = min(n, cap)
+    need = max(1, math.ceil(pause_s / 0.05))
+    run = 0
+    for i in range(first, last):
+        run = run + 1 if rms[i] <= threshold else 0
+        if run >= need:
+            return (i - need // 2) * frame + frame // 2
+    if n < cap:
+        return None  # nothing quiet yet and still under the hard cap: keep waiting
+    lo = max(first, last - int(10 * sample_rate) // frame)
+    return (lo + int(np.argmin(rms[lo:last]))) * frame + frame // 2
+
+
+@dataclass
+class LiveResult:
+    segments: list[Segment] = field(default_factory=list)
+    covered: int = 0                   # samples (from the start, at 16 kHz) fully transcribed
+    chunks: int = 0
+    degraded: bool = False             # greedy decoding was used for some chunk
+    stopped_reason: str | None = None  # why it quit before the end of the recording
+
+
+class LiveTranscriber:
+    """Transcribes a recording in the background while it is still being made.
+
+    The recorder's writer thread hands every block to `feed` (cheap: it only appends). A worker
+    thread cuts that buffer at pauses and transcribes the pieces in order. It tracks only `covered`,
+    how far it has got; the saved WAV stays the source of truth, so whatever is not covered when
+    recording ends (everything, if live gave up) is simply transcribed from the file as before.
+
+    Governor, checked about once a second, on `lag` = audio recorded but not yet transcribed:
+      * lag > LIVE_DEGRADE_LAG_S, or the recorder reports dropped audio -> beam 1 (faster, rougher)
+      * lag > LIVE_DEFER_LAG_S, or dropped audio again while degraded -> stop; the rest runs after
+      * lag < LIVE_RECOVER_LAG_S (and no dropouts seen) -> back to the normal beam
+    """
+
+    TICK_S = 1.0
+
+    def __init__(self, transcriber, word_timestamps: bool = False,
+                 dropouts: Callable[[], int] | None = None,
+                 min_chunk_s: float = LIVE_MIN_CHUNK_S, max_chunk_s: float = LIVE_MAX_CHUNK_S,
+                 degrade_lag_s: float = LIVE_DEGRADE_LAG_S, defer_lag_s: float = LIVE_DEFER_LAG_S,
+                 recover_lag_s: float = LIVE_RECOVER_LAG_S):
+        import numpy as np
+
+        self._np = np
+        self._tr = transcriber
+        self._words = word_timestamps
+        self._dropouts = dropouts
+        self.min_chunk_s, self.max_chunk_s = min_chunk_s, max_chunk_s
+        self.degrade_lag_s, self.defer_lag_s, self.recover_lag_s = degrade_lag_s, defer_lag_s, recover_lag_s
+        self._lock = threading.Lock()
+        self._parts: list = []        # int16 blocks not yet cut into a chunk
+        self._cursor = 0              # samples already transcribed
+        self._total = 0               # samples received
+        self._resampler = None
+        self._segments: list[Segment] = []
+        self._chunks = 0
+        self._prompt = ""
+        self._degraded = False
+        self._ever_degraded = False
+        self._strikes = 0             # times the recorder reported dropped audio
+        self._seen_dropouts = 0
+        self._reason: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.busy = False
+
+    # -- called from the recorder's writer thread --------------------------
+
+    def feed(self, block, rate: int) -> None:
+        if self._reason is not None or self._stop.is_set():
+            return
+        np = self._np
+        if rate != TARGET_RATE:
+            if self._resampler is None:
+                self._resampler = LinearResampler(rate, TARGET_RATE)
+            block = np.clip(np.rint(self._resampler.process(block)), -32768, 32767).astype(np.int16)
+        with self._lock:
+            self._parts.append(block)
+            self._total += len(block)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="live-transcribe", daemon=True)
+        self._thread.start()
+
+    def finish(self) -> LiveResult:
+        """Stop after the chunk in progress (if any) and report how far it got."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        with self._lock:
+            return LiveResult(
+                segments=sorted(self._segments, key=lambda s: s.start), covered=self._cursor,
+                chunks=self._chunks, degraded=self._ever_degraded, stopped_reason=self._reason,
+            )
+
+    # -- worker ------------------------------------------------------------
+
+    def _run(self) -> None:
+        _lower_thread_priority()
+        try:
+            while not self._stop.wait(self.TICK_S):
+                while not self._stop.is_set() and self._step():
+                    pass
+        except Exception as e:  # nothing was lost: the unprocessed audio is still in the WAV
+            self._abandon(f"background transcription failed: {e}")
+
+    def _step(self) -> bool:
+        """Transcribe one chunk if one is ready. Returns True if it did."""
+        if not self._govern():
+            return False
+        np = self._np
+        with self._lock:
+            pending = np.concatenate(self._parts) if self._parts else np.zeros(0, dtype=np.int16)
+            cursor = self._cursor
+        cut = find_live_cut(pending, TARGET_RATE, self.min_chunk_s, self.max_chunk_s)
+        if cut is None:
+            return False
+        self.busy = True
+        try:
+            segs = self._tr.transcribe_piece(
+                pending[:cut], offset=cursor / TARGET_RATE, word_timestamps=self._words,
+                beam_size=1 if self._degraded else WHISPER_BEAM_SIZE,
+                initial_prompt=self._prompt or None,
+            )
+        finally:
+            self.busy = False
+        with self._lock:
+            self._segments.extend(segs)
+            self._chunks += 1
+            # `feed` kept appending while we transcribed, so drop only the finished prefix of what is
+            # buffered *now* (never overwrite with the old snapshot). Invariant: _parts == samples [cursor, total).
+            buffered = np.concatenate(self._parts)
+            self._parts = [buffered[cut:]] if cut < len(buffered) else []
+            self._cursor = cursor + cut
+        if segs:
+            self._prompt = " ".join(s.text for s in segs)[-200:]
+        return True
+
+    def _govern(self) -> bool:
+        """Apply the back-off rules. Returns False if live transcription just gave up."""
+        with self._lock:
+            lag = (self._total - self._cursor) / TARGET_RATE
+        dropped = self._dropouts() if self._dropouts else 0
+        rose, self._seen_dropouts = dropped > self._seen_dropouts, dropped
+        if rose:
+            self._strikes += 1
+            if self._strikes >= 2:
+                self._abandon("the recorder dropped audio, so the CPU is overloaded")
+                return False
+            self._degraded = self._ever_degraded = True
+        if lag > self.defer_lag_s:
+            self._abandon(f"it fell {lag:.0f} s behind the recording")
+            return False
+        if lag > self.degrade_lag_s:
+            self._degraded = self._ever_degraded = True
+        elif self._degraded and lag < self.recover_lag_s and self._strikes == 0:
+            self._degraded = False
+        return True
+
+    def _abandon(self, reason: str) -> None:
+        with self._lock:
+            self._reason = reason
+            self._parts = []  # stop holding audio; it is all in the WAV
 
 
 def plain_text(segments: list[Segment]) -> str:
@@ -1609,6 +1879,8 @@ class VoiceRecorder:
         self._use_gpu = False
         self._srt = False
         self._preview = True
+        self._live_enabled = False
+        self._live: LiveTranscriber | None = None
         self._stop_event = threading.Event()
 
     def setup(self, args):
@@ -1629,10 +1901,13 @@ class VoiceRecorder:
         else:
             self.ui.info("Using explicit output file path(s).")
 
+        # Background transcription while recording is on unless --no-live (or there is nothing to record).
+        self._live_enabled = not getattr(args, "no_live", True) and not getattr(args, "from_file", None)
+        extra = {"cpu_threads": live_cpu_threads()} if self._live_enabled else {}
         self._model_size = (getattr(args, "model", None) or "small").lower()
         self.ui.info(f"Loading faster-whisper model ({self._model_size})...")
         try:
-            self.transcriber = Transcriber(model_size=self._model_size, use_gpu=self._use_gpu)
+            self.transcriber = Transcriber(model_size=self._model_size, use_gpu=self._use_gpu, **extra)
             self.transcriber.load_model()
         except Exception as e:
             self.ui.info(f"Error loading transcription model: {e}")
@@ -1659,12 +1934,29 @@ class VoiceRecorder:
 
     # -- processing --------------------------------------------------------
 
-    def process(self, samples) -> Result:
-        """16 kHz mono int16 samples -> transcript (speaker-labelled if a diarizer is active)."""
+    def process(self, samples, live: LiveResult | None = None) -> Result:
+        """16 kHz mono int16 samples -> transcript (speaker-labelled if a diarizer is active).
+
+        `live` carries what background transcription already did; only the audio after
+        `live.covered` is transcribed here.
+        """
         duration = len(samples) / TARGET_RATE
-        with self.ui.progress("Transcribing", duration) as progress:
-            segments = self.transcriber.transcribe(
-                samples, word_timestamps=self.diarizer is not None or self._srt, progress=progress)
+        start = min(live.covered, len(samples)) if live else 0
+        segments = list(live.segments) if live else []
+        left = (len(samples) - start) / TARGET_RATE
+        if left >= 0.3:
+            if live and left > LIVE_FULL_THREADS_TAIL_S:
+                # Live mode runs the model on a few cores; a big leftover deserves all of them.
+                self.ui.info(f"{format_clock(left)} left to transcribe; using all CPU cores.")
+                try:
+                    self.transcriber.set_cpu_threads(0)
+                except Exception as e:
+                    self.ui.warn(f"could not switch to all cores ({e}); continuing as is.")
+            extra = {"offset": start / TARGET_RATE} if start else {}
+            with self.ui.progress("Transcribing", left) as progress:
+                segments += self.transcriber.transcribe(
+                    samples[start:], word_timestamps=self.diarizer is not None or self._srt,
+                    progress=progress, **extra)
 
         turns = None
         if self.diarizer is not None:
@@ -1783,13 +2075,22 @@ class VoiceRecorder:
             os.close(fd)
             wav_path = Path(tmp)
 
-        self.recorder = AudioRecorder(wav_path, on_error=self._stop_event.set)
+        self._live = None
+        if self._live_enabled:
+            self._live = LiveTranscriber(
+                self.transcriber, word_timestamps=self.diarizer is not None or self._srt,
+                dropouts=lambda: self.recorder.dropouts if self.recorder else 0)
+        self.recorder = AudioRecorder(
+            wav_path, on_error=self._stop_event.set,
+            on_samples=self._live.feed if self._live else None)
         try:
             self.recorder.start()
         except Exception as e:
             self.ui.info(f"Error starting recorder: {e}")
             wav_path.unlink(missing_ok=True)
             sys.exit(1)
+        if self._live:
+            self._live.start()
         self.ui.info(f"Using microphone: {self.recorder.device_name}")
 
         # Ctrl+C only sets a flag; the main thread blocks on the event.
@@ -1805,6 +2106,7 @@ class VoiceRecorder:
         if self.recorder.error:
             self.ui.warn(f"recording stopped early: {self.recorder.error}")
         try:
+            live_result = self._finish_live(wav_path if self._save_audio else None)
             if seconds < 0.5:
                 self.ui.info("Recording too short; nothing to transcribe.")
                 wav_path.unlink(missing_ok=True)
@@ -1814,23 +2116,52 @@ class VoiceRecorder:
             samples = read_wav_as_16k_mono(wav_path)
             self._transcribe_and_save(
                 samples, outputs, started, outputs.wav if self._save_audio else None,
-                wav_path if self._save_audio else None,
+                wav_path if self._save_audio else None, live=live_result,
             )
         finally:
             if not self._save_audio:
                 wav_path.unlink(missing_ok=True)
 
+    def _finish_live(self, keep_audio: Path | None) -> LiveResult | None:
+        """Stop background transcription (waiting for the chunk in progress, if any)."""
+        if self._live is None:
+            return None
+        try:
+            if self._live.busy:
+                self.ui.info("\nFinishing background transcription...")
+            return self._live.finish()
+        except KeyboardInterrupt:
+            self.ui.info("\nInterrupted.")
+            self._audio_safe_hint(keep_audio)
+            sys.exit(130)
+
+    def _report_live(self, live: LiveResult, duration: float) -> None:
+        done = live.covered / TARGET_RATE
+        if live.stopped_reason:
+            self.ui.warn(
+                f"background transcription stopped early because {live.stopped_reason}; "
+                f"{format_clock(max(0.0, duration - done))} is left to do now."
+            )
+        else:
+            self.ui.info(f"✓ {format_clock(done)} of {format_clock(duration)} was transcribed while recording.")
+        if live.degraded:
+            self.ui.warn("the machine was busy, so part of it used faster, slightly less accurate decoding.")
+
     def _transcribe_and_save(self, samples, outputs: Outputs, recorded_at: datetime,
-                             audio_ref: Path | None, keep_audio: Path | None):
+                             audio_ref: Path | None, keep_audio: Path | None,
+                             live: LiveResult | None = None):
         duration = len(samples) / TARGET_RATE
-        if duration > 600:
+        left = duration - (min(live.covered, len(samples)) / TARGET_RATE if live else 0.0)
+        if live:
+            self._report_live(live, duration)
+        if left > 600:
             self.ui.info(
-                f"Processing {format_clock(duration)} of audio; this can take a while on slow hardware. "
+                f"Processing {format_clock(left)} of audio; this can take a while on slow hardware. "
                 "Use a smaller --model to go faster."
             )
         self.ui.info("Processing... (Ctrl+C to abort)")
         try:
-            result = self.process(samples)
+            result = self.process(samples, live) if live else self.process(samples)
             self.ui.info(f"Transcription complete: {len(result.body)} characters")
             srt_path, cues = self.save_captions(result, outputs) if self._srt else (None, [])
             self.save_transcript(result, outputs, recorded_at, audio_ref, srt_path.name if srt_path else None)
@@ -1922,6 +2253,11 @@ Exit codes: 0 ok, 1 no mic / unreadable input, 2 cannot write output,
     parser.add_argument(
         "--no-preview", action="store_true",
         help="Do not display the caption file on screen after transcribing (shown by default with --srt)",
+    )
+    parser.add_argument(
+        "--no-live", action="store_true",
+        help="Do not transcribe in the background while recording (default: on, using about half the CPU "
+             "cores at low priority, so less is left to do when you stop)",
     )
     parser.add_argument(
         "--no-audio", action="store_true",

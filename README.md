@@ -87,6 +87,7 @@ If a name is already taken, `_1`, `_2`... is appended to the filename(s); nothin
 | `--no-preview` | Do not display the caption file after transcribing (shown by default with `--srt`) |
 | `--diarize` | Label speakers (needs `sherpa-onnx`) |
 | `--speakers N`, `-n` | Number of speakers, if known (implies `--diarize`) |
+| `--no-live` | Do not transcribe in the background while recording (see [Background transcription](#background-transcription-while-you-record)) |
 | `--no-audio` | Do not keep the `.wav` (cannot be combined with `--audio-path`) |
 | `--from-file WAV` | Transcribe an existing recording instead of using the mic; cannot be combined with `--audio-path` |
 | `--no-ui` | Plain text output: no colours, no screen clear (automatic when output is piped or not a terminal) |
@@ -105,6 +106,29 @@ The screen is cleared when the app starts, so the recording display is the only 
 On a terminal you get a live display: a blinking `● REC`, the elapsed time (`MM:SS`, `HH:MM:SS` past an hour), a green-to-red level meter and 16 frequency bars. If no signal arrives for 3 seconds it warns you ("No input signal - is the microphone connected and unmuted?"), and it flags clipping. Press **Ctrl+C** to stop.
 
 Using the existing signal threshold (peak above about **-54 dBFS**), if the microphone remains silent for **20 seconds**, an automatic **30-second stop countdown** starts. The live display shows a highlighted **[C] Cancel countdown** control—press `C` (no Enter needed) to cancel it. If audio resumes, the countdown clears; after cancellation it will only arm again once audio has returned and silence is detected anew. In non-interactive runs the countdown still stops the recording, but there is no keyboard cancel control.
+
+### Background transcription while you record
+
+On by default: while the meeting is still going, a background worker transcribes it in pieces, so when you press Ctrl+C there is only the last stretch left to do. Turn it off with `--no-live` to get the old behaviour (everything is transcribed after you stop).
+
+How it stays out of the way:
+
+- **Cuts at pauses.** The audio is split at the first pause (0.4 s+) after 30 seconds, and never later than 60 seconds, so a cut almost never lands inside a word. Each piece is prompted with the text before it for consistent spelling.
+- **Uses about half your cores, at low priority.** Two threads on a 4-core machine (the model runs with `cpu_threads` set to half the cores, at most 4), and on Linux the worker thread also runs at a lower `nice` than the recorder. Only one piece is processed at a time; a second model is never loaded.
+- **Backs off when the machine can't keep up.** It watches how much recorded audio is still waiting. More than 2 minutes behind (or the sound card reporting dropped audio) switches to faster greedy decoding (slightly less accurate). More than 4 minutes behind, or dropped audio again, and it stops; the rest is transcribed after you stop, exactly as without `--no-live`. You are told at the end if either happened.
+- **The WAV is still the source of truth.** The worker only remembers how far it got. Anything it did not finish, including everything if it failed or gave up, is transcribed from the saved file after recording, so the worst case is today's behaviour.
+- **Speaker labels (`--diarize`) still run after you stop**, on the whole recording: they need to hear everyone before deciding who is who. Word timestamps for `--srt` / `--diarize` are collected in the background.
+
+When you stop, the app waits for the piece in progress (up to about 30 s of audio, so typically 10-30 s on a Pi) and then transcribes whatever is left. Throwing that piece away would only make the wait longer.
+
+**Measured on a Raspberry Pi 4 (4 cores, CPU), one 3.5 minute two-speaker recording fed through the real recording path at real-time speed.** "Wait" is the time between pressing Ctrl+C and the transcript being saved:
+
+| Model | Without live (`--no-live`) | With live | Done before you stopped | Worst lag | CPU while recording | Peak memory | Dropped audio |
+|---|---|---|---|---|---|---|---|
+| `base` | 94 s wait | **10 s wait** | 178 s of 210 s | 54 s | 0.5 cores | 495 MB | none |
+| `small` | 214 s wait | **31 s wait** | 209 s of 210 s | 73 s | 1.3 cores | 867 MB | none |
+
+Neither run needed the back-off. The transcripts matched the all-at-the-end ones (`small`: 97.6% word-level similarity, differing in fillers and homophones; `base`: same content in the same order, same word count within 2). These are single runs on a 3.5 minute clip: with a long meeting the wait should stay about the same as long as the worker keeps up (it does not grow with meeting length), but I have not measured a long meeting. `small` was creeping up on the 2-minute degrade threshold (worst lag 73 s after 3.5 minutes) and would probably drop to greedy decoding at some point in a long meeting on this hardware; `base` has plenty of headroom. On a fast machine or with `--gpu` it should simply keep up.
 
 ### While transcribing
 
@@ -216,6 +240,7 @@ src/voice_recorder_cli.py
 ├── WavWriter / LinearResampler / read_wav_as_16k_mono   # WAV streaming + loading
 ├── AudioRecorder   # sounddevice callback -> queue -> writer thread -> .wav (+ live level snapshot)
 ├── plan_chunks / Transcriber   # chunked faster-whisper transcription with progress
+├── find_live_cut / LiveTranscriber  # background transcription while recording (pause-cut chunks, back-off governor)
 ├── Diarizer        # sherpa-onnx speaker turns
 ├── label_words / group_utterances   # word-level speaker alignment
 ├── build_cues / render_srt          # caption cues -> SubRip
